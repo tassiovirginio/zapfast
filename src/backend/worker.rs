@@ -1628,6 +1628,35 @@ impl Worker {
         }
     }
 
+    /// Every archive row that stands for one conversation: the chat itself,
+    /// its canonical phone-number id, and the privacy-id rows whose mapping
+    /// is known. A message arriving before its mapping leaves neither one
+    /// alone, so reading one conversation must clear them all.
+    fn conversation_ids(&self, chat: &str) -> Vec<String> {
+        let canonical = self.canonical_str(chat);
+        let mut ids = vec![chat.to_owned()];
+        if !ids.contains(&canonical) {
+            ids.push(canonical.clone());
+        }
+        // Privacy ids alias direct phone numbers, never groups or channels,
+        // and never our own account.
+        if canonical.ends_with("@lid") || self.is_me(&canonical) {
+            return ids;
+        }
+        let user = canonical.split('@').next().unwrap_or_default().to_owned();
+        for lid in self
+            .lid_to_pn
+            .iter()
+            .filter(|(_, pn)| **pn == user)
+            .map(|(lid, _)| format!("{lid}@lid"))
+        {
+            if !ids.contains(&lid) {
+                ids.push(lid);
+            }
+        }
+        ids
+    }
+
     /// App-state mutations may use a privacy id before a message teaches the UI
     /// its mapping. Consult the protocol library's persisted mapping as well.
     async fn canonical_sync_chat(&mut self, jid: &Jid) -> String {
@@ -2225,19 +2254,25 @@ impl Worker {
                         .message_range
                         .as_option()
                         .and_then(|range| range.last_message_timestamp);
-                    if let Some(through) = through {
-                        let _ = self.archive.mark_read_through(&chat, seconds(through));
-                    } else {
-                        let _ = self.archive.mark_read(&chat);
+                    // A conversation read on the phone clears every row that
+                    // stands for it, including a privacy-id row left from
+                    // before its mapping was known.
+                    for id in self.conversation_ids(&chat) {
+                        if let Some(through) = through {
+                            let _ = self.archive.mark_read_through(&id, seconds(through));
+                        } else {
+                            let _ = self.archive.mark_read(&id);
+                        }
+                        let _ = self.archive.set_marked_unread(&id, false);
+                        self.emit_chat(&id);
                     }
-                    let _ = self.archive.set_marked_unread(&chat, false);
                 } else {
                     // Marked unread on another device: the empty dot, as the
                     // phone shows it, with any real count kept.
                     let _ = self.archive.finish_read_sync(&chat, i64::MAX);
                     let _ = self.archive.set_marked_unread(&chat, true);
+                    self.emit_chat(&chat);
                 }
-                self.emit_chat(&chat);
             }
             E::HistorySync(lazy) => self.on_history_sync(lazy).await,
             E::DisappearingModeChanged(update) => {
@@ -5297,27 +5332,36 @@ impl Worker {
     }
 
     fn mark_read(&mut self, chat: ChatId, receipts: bool) {
-        let Ok(Some(row)) = self.archive.chat(&chat) else {
-            return;
-        };
+        // One conversation can leave a privacy-id row behind from a message
+        // that arrived before its phone-number mapping. Reading it must clear
+        // every row, or the Archived chip counts it as unread forever.
+        let ids = self.conversation_ids(&chat);
         // Collect before advancing the archive's read position.
-        let ids = if receipts {
-            self.archive
-                .unread_incoming(&chat, row.unread)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let _ = self.archive.mark_read(&chat);
-        self.emit_chat(&chat);
+        let mut ids_for_receipts = Vec::new();
+        let mut unread = false;
+        for id in &ids {
+            let Ok(Some(row)) = self.archive.chat(id) else {
+                continue;
+            };
+            unread |= row.unread > 0 || row.marked_unread;
+            if receipts && row.unread > 0 {
+                ids_for_receipts.extend(
+                    self.archive
+                        .unread_incoming(id, row.unread)
+                        .unwrap_or_default(),
+                );
+            }
+            let _ = self.archive.mark_read(id);
+            self.emit_chat(id);
+        }
         // A chat marked unread with nothing pending still tells the phone it
         // was read, which is what takes the phone's mark off.
-        if row.unread == 0 && !row.marked_unread {
+        if !unread {
             return;
         }
         let _ = self.archive.queue_read_sync(&chat);
         self.pump_read_sync();
-        self.send_read_receipts(chat, ids);
+        self.send_read_receipts(chat, ids_for_receipts);
     }
 
     fn pump_read_sync(&mut self) {
@@ -10660,6 +10704,85 @@ mod receipt_tests {
         assert_eq!(
             worker.archive.chat(PEER).unwrap().unwrap().muted_until,
             None
+        );
+    }
+
+    #[test]
+    fn reading_an_archived_chat_clears_a_privacy_id_ghost_row() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        // A message archives under the privacy id before its phone-number
+        // mapping is known.
+        let mut first = incoming("a", 100);
+        first.chat = PEER_LID.into();
+        first.sender = PEER_LID.into();
+        worker.store_message(first, None, None);
+        worker.archive.set_archived_at(PEER_LID, true, 200).unwrap();
+        // The mapping arrives: preferences move to the canonical chat, but the
+        // privacy-id row keeps its messages and unread count.
+        worker.learn_lid("167650256810092", "4917663430455");
+        assert!(worker.archive.chat(PEER_LID).unwrap().unwrap().archived);
+        assert!(worker.archive.chat(PEER).unwrap().unwrap().archived);
+        assert_eq!(worker.archive.chat(PEER_LID).unwrap().unwrap().unread, 1);
+        // Reading the canonical chat must clear the ghost row too, or the
+        // Archived chip keeps counting this conversation as unread forever.
+        worker.mark_read(PEER.into(), false);
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert_eq!(
+            chats
+                .iter()
+                .filter(|chat| chat.archived && chat.unread > 0)
+                .count(),
+            0,
+            "reading the canonical row must clear the lid row's unread too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_on_the_phone_clears_a_privacy_id_ghost_row() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let mut first = incoming("a", 100);
+        first.chat = PEER_LID.into();
+        first.sender = PEER_LID.into();
+        worker.store_message(first, None, None);
+        worker.archive.set_archived_at(PEER_LID, true, 200).unwrap();
+        worker.learn_lid("167650256810092", "4917663430455");
+        // The phone read the conversation after the mapping existed.
+        let event = wa_events::MarkChatAsReadUpdate::builder()
+            .jid(PEER_LID.parse().unwrap())
+            .timestamp(whatsapp_rust::wacore::time::now_utc())
+            .from_full_sync(false)
+            .action(Box::new(wa::sync_action_value::MarkChatAsReadAction {
+                read: Some(true),
+                message_range: MessageField::none(),
+            }))
+            .build();
+        worker
+            .handle_wa_event(Arc::new(wa_events::Event::MarkChatAsReadUpdate(event)))
+            .await;
+        worker.emit_chats();
+        let chats = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Chats(chats) => Some(chats),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        assert_eq!(
+            chats
+                .iter()
+                .filter(|chat| chat.archived && chat.unread > 0)
+                .count(),
+            0,
+            "a read on the phone must clear the privacy-id row's unread too"
         );
     }
 

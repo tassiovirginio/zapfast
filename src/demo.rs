@@ -5162,6 +5162,65 @@ mod tests {
     }
 
     #[test]
+    fn reading_an_archived_chat_lowers_the_archived_chip_count() {
+        let mut app = app();
+        // The Archived chip only exists past the filter chips; the sidebar has
+        // to be wide enough for the row to show it.
+        app.settings.sidebar_width = 520.0;
+        let archived = app
+            .chats
+            .iter()
+            .find(|chat| chat.archived)
+            .expect("an archived sample chat")
+            .id
+            .clone();
+        app.chats
+            .iter_mut()
+            .find(|chat| chat.id == archived)
+            .unwrap()
+            .unread = 3;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        assert_eq!(app.archived_unread(), 1, "the chip counts the unread chat");
+        let click = |app: &mut App, ctx: &egui::Context, rect: egui::Rect| {
+            let pos = rect.center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame_with(app, ctx, vec![egui::Event::PointerMoved(pos), press(true)]);
+            frame_with(app, ctx, vec![press(false)]);
+            render(app, ctx);
+        };
+        let chip = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("archived-chip")))
+            .expect("the archived chip is on screen");
+        click(&mut app, &ctx, chip);
+        assert!(app.show_archived, "the archived view opened");
+        let row = ctx
+            .data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::chat_row_id(&archived)))
+            .expect("the archived chat row is on screen");
+        click(&mut app, &ctx, row);
+        assert_eq!(app.open_chat, Some(archived.clone()));
+        assert_eq!(
+            app.archived_unread(),
+            0,
+            "opening and reading clears the chip count"
+        );
+        // Toggle the armed chip again, the way one returns to every chat.
+        let chip = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("archived-chip")))
+            .expect("the archived chip is still on screen");
+        click(&mut app, &ctx, chip);
+        assert!(!app.show_archived, "the chip returns to the chat list");
+        assert_eq!(app.archived_unread(), 0, "the count stays cleared");
+    }
+
+    #[test]
     fn errors_stay_until_dismissed_while_info_fades() {
         let mut app = app();
         app.toast("Copied");
