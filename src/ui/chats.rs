@@ -362,22 +362,20 @@ fn filter_chips(app: &mut App, ui: &mut egui::Ui) {
                         app.actions.push(Action::SetChatFilter(next));
                     }
                 }
-                if app.archived_count() > 0 || app.show_archived {
-                    let selected = app.show_archived;
-                    let chip = widgets::filter_chip(
-                        ui,
-                        &palette,
-                        crate::i18n::gettext(app.locale, "Archived").as_ref(),
-                        app.archived_unread(),
-                        selected,
-                    )
-                    .tab_stop(Stop::Archived);
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(egui::Id::new("archived-chip"), chip.rect);
-                    });
-                    if chip.clicked() {
-                        app.actions.push(Action::ShowArchived(!selected));
-                    }
+                let selected = app.show_archived;
+                let chip = widgets::filter_chip(
+                    ui,
+                    &palette,
+                    crate::i18n::gettext(app.locale, "Archived").as_ref(),
+                    app.archived_unread(),
+                    selected,
+                )
+                .tab_stop(Stop::Archived);
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("archived-chip"), chip.rect);
+                });
+                if chip.clicked() {
+                    app.actions.push(Action::ShowArchived(!selected));
                 }
                 if app.locked_count() > 0 || app.locked_folder_open() {
                     let selected = app.locked_folder_open();

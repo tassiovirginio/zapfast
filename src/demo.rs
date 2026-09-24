@@ -5221,6 +5221,27 @@ mod tests {
     }
 
     #[test]
+    fn the_archived_chip_stays_visible_without_archived_chats() {
+        let mut app = app();
+        for chat in &mut app.chats {
+            chat.archived = false;
+        }
+        app.open_chat = None;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        let chip = ctx
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("archived-chip")))
+            .expect("the Archived chip is always on screen");
+        assert!(
+            chip.is_positive(),
+            "an empty archived folder still has its button"
+        );
+        assert_eq!(app.archived_unread(), 0, "nothing archived to count");
+    }
+
+    #[test]
     fn errors_stay_until_dismissed_while_info_fades() {
         let mut app = app();
         app.toast("Copied");
