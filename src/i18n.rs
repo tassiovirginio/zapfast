@@ -5,10 +5,8 @@
 //! English is both the source language and the fallback for any untranslated
 //! message. Only languages with a catalog are offered.
 
-use std::borrow::Cow;
-
+pub use fastframe_i18n::{gettext, ngettext, pgettext};
 use serde::{Deserialize, Serialize};
-use tr::Translator;
 
 include!(concat!(env!("OUT_DIR"), "/catalogs.rs"));
 
@@ -30,11 +28,13 @@ pub enum Locale {
     French,
     #[serde(rename = "ru")]
     Russian,
+    #[serde(rename = "zh-Hans")]
+    ChineseSimplified,
 }
 
 impl Locale {
     /// Every locale shown in the language picker, in a stable order.
-    pub const ALL: [Locale; 7] = [
+    pub const ALL: [Locale; 8] = [
         Self::English,
         Self::PortugueseBrazil,
         Self::German,
@@ -42,6 +42,7 @@ impl Locale {
         Self::Italian,
         Self::French,
         Self::Russian,
+        Self::ChineseSimplified,
     ];
 
     /// The language's own name, for the picker.
@@ -54,18 +55,20 @@ impl Locale {
             Self::Italian => "Italiano",
             Self::French => "Français",
             Self::Russian => "Русский",
+            Self::ChineseSimplified => "简体中文",
         }
     }
 
-    /// Maps a BCP 47 system-locale identifier to a supported locale by its
-    /// language subtag, so `pt-PT` and `pt_BR` both resolve to Portuguese.
+    /// Maps a system language tag (BCP 47 or POSIX) to a supported locale by
+    /// its language subtag, so `pt-PT` and `pt_BR` both resolve to Portuguese.
+    /// Chinese is the exception: its script decides, so a reader who asked for
+    /// Traditional keeps English instead of getting the wrong characters.
     pub fn from_system(identifier: &str) -> Option<Locale> {
-        let language = identifier
-            .split(['-', '_'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        Some(match language.as_str() {
+        fastframe_i18n::LanguageTag::parse(identifier).and_then(|tag| Self::from_tag(&tag))
+    }
+
+    fn from_tag(tag: &fastframe_i18n::LanguageTag) -> Option<Locale> {
+        Some(match tag.language.as_str() {
             "en" => Self::English,
             "pt" => Self::PortugueseBrazil,
             "de" => Self::German,
@@ -73,11 +76,19 @@ impl Locale {
             "it" => Self::Italian,
             "fr" => Self::French,
             "ru" => Self::Russian,
+            "zh" => match (tag.script.as_deref(), tag.region.as_deref()) {
+                // Windows writes the legacy `zh-CHT` region, macOS and Linux
+                // the script or the region subtag.
+                (Some("hant"), _) | (_, Some("tw" | "hk" | "mo" | "cht")) => return None,
+                _ => Self::ChineseSimplified,
+            },
             _ => return None,
         })
     }
+}
 
-    fn translator(self) -> Option<&'static dyn Translator> {
+impl fastframe_i18n::Locale for Locale {
+    fn catalog(self) -> Option<&'static dyn fastframe_i18n::Translator> {
         match self {
             Self::PortugueseBrazil => Some(&pt_br::Translator),
             Self::German => Some(&de::Translator),
@@ -85,12 +96,14 @@ impl Locale {
             Self::French => Some(&fr::Translator),
             Self::Italian => Some(&it::Translator),
             Self::Russian => Some(&ru::Translator),
+            Self::ChineseSimplified => Some(&zh_hans::Translator),
             Self::English => None,
         }
     }
 }
 
-/// The operating system's preferred locale, falling back to English.
+/// The first supported language the operating system prefers, falling back
+/// to English.
 ///
 /// Unit tests assert the English source strings, so the machine the suite runs
 /// on must not decide their outcome: a developer with a Portuguese Brazil
@@ -100,46 +113,12 @@ pub fn detect() -> Locale {
     if cfg!(test) {
         return Locale::English;
     }
-    sys_locale::get_locale()
-        .as_deref()
-        .and_then(Locale::from_system)
-        .unwrap_or_default()
+    fastframe_i18n::detect(Locale::from_tag).unwrap_or_default()
 }
 
 /// Resolves a stored preference: an explicit choice wins, otherwise detect.
 pub fn resolve(interface_language: Option<Locale>) -> Locale {
     interface_language.unwrap_or_else(detect)
-}
-
-/// The English source is also the fallback for untranslated messages.
-pub fn gettext(locale: Locale, source: &'static str) -> Cow<'static, str> {
-    locale
-        .translator()
-        .map_or(Cow::Borrowed(source), |catalog| {
-            catalog.translate(source, None)
-        })
-}
-
-/// Translate a phrase whose meaning depends on its interface context.
-pub fn pgettext(locale: Locale, context: &'static str, source: &'static str) -> Cow<'static, str> {
-    locale
-        .translator()
-        .map_or(Cow::Borrowed(source), |catalog| {
-            catalog.translate(source, Some(context))
-        })
-}
-
-/// Select a whole translated phrase using the catalog's gettext plural rules.
-pub fn ngettext(
-    locale: Locale,
-    singular: &'static str,
-    plural: &'static str,
-    count: u32,
-) -> Cow<'static, str> {
-    locale.translator().map_or(
-        Cow::Borrowed(if count == 1 { singular } else { plural }),
-        |catalog| catalog.ntranslate(count.into(), singular, plural, None),
-    )
 }
 
 #[cfg(test)]
@@ -155,10 +134,37 @@ mod tests {
         assert_eq!(Locale::from_system("it-IT"), Some(Locale::Italian));
         assert_eq!(Locale::from_system("fr-FR"), Some(Locale::French));
         assert_eq!(Locale::from_system("ru-RU"), Some(Locale::Russian));
-        assert_eq!(Locale::from_system("zh-Hans"), None);
+        assert_eq!(
+            Locale::from_system("zh-Hans"),
+            Some(Locale::ChineseSimplified)
+        );
+        assert_eq!(Locale::from_system("zh"), Some(Locale::ChineseSimplified));
+        assert_eq!(
+            Locale::from_system("zh_CN.GB2312"),
+            Some(Locale::ChineseSimplified)
+        );
+        // Traditional Chinese has no catalog, so it keeps English rather than
+        // showing Simplified characters to a reader who asked for another script.
+        assert_eq!(Locale::from_system("zh-TW"), None);
+        assert_eq!(Locale::from_system("zh-Hant"), None);
+        assert_eq!(Locale::from_system("zh-CHT"), None);
         assert_eq!(Locale::from_system("en-US"), Some(Locale::English));
         assert_eq!(Locale::from_system("ja-JP"), None);
         assert_eq!(Locale::default(), Locale::English);
+    }
+
+    /// Every preferred language is tried in order, not only the first: a
+    /// desktop that lists an unsupported language first still gets the next.
+    #[test]
+    fn the_first_supported_preferred_language_wins() {
+        assert_eq!(
+            fastframe_i18n::first_supported(["nb-NO", "de-DE", "fr-FR"], Locale::from_tag),
+            Some(Locale::German)
+        );
+        assert_eq!(
+            Locale::from_system("pt_BR.UTF-8"),
+            Some(Locale::PortugueseBrazil)
+        );
     }
 
     /// The suite asserts the English source strings, so the language of the
@@ -255,6 +261,42 @@ mod tests {
         assert_eq!(pgettext(Locale::PortugueseBrazil, "verb", "Chats"), "Chats");
         assert_eq!(pgettext(Locale::English, "verb", "Chats"), "Chats");
         assert_eq!(gettext(Locale::PortugueseBrazil, "Chats"), "Conversas");
+    }
+
+    #[test]
+    fn chinese_simplified_catalog_translates() {
+        assert_eq!(gettext(Locale::ChineseSimplified, "Chats"), "聊天");
+        assert_eq!(gettext(Locale::ChineseSimplified, "Search"), "搜索");
+        assert_eq!(gettext(Locale::ChineseSimplified, "Settings"), "设置");
+        assert_eq!(
+            gettext(Locale::ChineseSimplified, "Type a message"),
+            "输入消息"
+        );
+        assert_eq!(gettext(Locale::ChineseSimplified, "Monday"), "周一");
+        assert_eq!(gettext(Locale::ChineseSimplified, "Yesterday"), "昨天");
+    }
+
+    /// Chinese has a single plural form, so one text covers every count.
+    #[test]
+    fn chinese_plural_rules_use_one_form() {
+        for count in [0, 1, 2, 21] {
+            assert_eq!(
+                ngettext(Locale::ChineseSimplified, "{} member", "{} members", count),
+                "{} 位成员"
+            );
+        }
+    }
+
+    /// The same English word with two meanings stays two different strings.
+    #[test]
+    fn chinese_contexts_stay_separate_from_plain_lookups() {
+        assert_eq!(gettext(Locale::ChineseSimplified, "About"), "关于");
+        assert_eq!(
+            pgettext(Locale::ChineseSimplified, "privacy", "About"),
+            "个人简介"
+        );
+        assert_eq!(gettext(Locale::ChineseSimplified, "Groups"), "群组");
+        assert_eq!(pgettext(Locale::ChineseSimplified, "sound", "None"), "无");
     }
 
     #[test]

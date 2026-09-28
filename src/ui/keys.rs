@@ -3,7 +3,7 @@
 use egui::{Key, Modifiers};
 
 use crate::app::App;
-use crate::model::{Action, Chat, Dialog, Page};
+use crate::model::{Action, Chat, Dialog, Page, Scroll};
 
 pub fn handle(app: &mut App, ctx: &egui::Context) {
     if app.image_preview.is_some() {
@@ -52,7 +52,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             key(Modifiers::COMMAND, Key::L, Action::FocusComposer);
         }
         key(Modifiers::COMMAND, Key::B, Action::ToggleSidebar);
-        key(Modifiers::COMMAND, Key::Comma, Action::Open(Page::Settings));
+        key(Modifiers::COMMAND, Key::Comma, Action::ToggleSettings);
         key(Modifiers::COMMAND, Key::Q, Action::Quit);
         key(Modifiers::COMMAND, Key::W, Action::CloseWindow);
         key(
@@ -70,17 +70,54 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     let menu_open = egui::Popup::is_any_open(ctx);
     let search_focused = ctx.memory(|memory| memory.has_focus(egui::Id::new("chat-search")));
     let composer_focused = ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text")));
+    // PgUp/PgDn/Home/End scroll the open chat. PgUp/PgDn also work while the
+    // composer has focus, since egui's TextEdit does not handle them itself;
+    // Home/End keep moving the text cursor in a non-empty field, as ↑ keeps
+    // its normal meaning outside an empty composer.
+    if app.page == Page::Chats
+        && app.open_chat.is_some()
+        && app.dialog.is_none()
+        && !app.show_update
+        && app.picker.is_none()
+        && app.reaction_target.is_none()
+        && !menu_open
+    {
+        let home_end_allowed = !editing_text || (composer_focused && app.composer.is_empty());
+        ctx.input_mut(|input| {
+            if take_plain(input, Key::PageUp) {
+                actions.push(Action::ScrollPage(Scroll::PageUp));
+            }
+            if take_plain(input, Key::PageDown) {
+                actions.push(Action::ScrollPage(Scroll::PageDown));
+            }
+            if home_end_allowed {
+                if take_plain(input, Key::Home) {
+                    actions.push(Action::ScrollPage(Scroll::Top));
+                }
+                if take_plain(input, Key::End) {
+                    actions.push(Action::ScrollPage(Scroll::Bottom));
+                }
+            }
+        });
+    }
     let escape = (!menu_open || app.reaction_target.is_some())
         && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
     if escape {
         if app.show_update {
             actions.push(Action::CloseUpdate);
+        } else if app.dialog.is_some() && app.group_name_edit.is_some() {
+            // Cancels the group rename and keeps the dialog open.
+            actions.push(Action::CloseGroupName);
         } else if app.dialog.is_some() {
             actions.push(Action::CloseDialog);
         } else if app.recording.is_some() {
             actions.push(Action::CancelRecording);
         } else if app.picker.is_some() || app.reaction_target.is_some() {
             actions.push(Action::ClosePicker);
+        } else if app.selection.is_some() {
+            // Taken here, the key never reaches the selection bar, and
+            // would otherwise fall through to closing the chat.
+            actions.push(Action::CancelSelection);
         } else if app.chat_search_visible() && app.chat_search_calendar {
             // The day filter first, then the pane it hangs from.
             app.chat_search_calendar = false;
@@ -123,11 +160,22 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     {
         actions.push(Action::SendRecording);
     }
-    // Alt+Up/Down switches chats without leaving the composer.
+    // Alt+Up/Down switches chats without leaving the composer, and so do
+    // Ctrl+Shift+[ and Ctrl+Shift+], WhatsApp's own keys. With Shift held,
+    // US-style layouts report the brackets as braces, so both spellings
+    // count; a layout with another character on the shifted key has Alt.
     let step = ctx.input_mut(|input| {
-        if input.consume_key(Modifiers::ALT, Key::ArrowDown) {
+        let brackets = Modifiers::COMMAND | Modifiers::SHIFT;
+        let mut pressed = |modifiers: Modifiers, keys: &[Key]| {
+            keys.iter().any(|key| input.consume_key(modifiers, *key))
+        };
+        if pressed(Modifiers::ALT, &[Key::ArrowDown])
+            || pressed(brackets, &[Key::CloseBracket, Key::CloseCurlyBracket])
+        {
             1
-        } else if input.consume_key(Modifiers::ALT, Key::ArrowUp) {
+        } else if pressed(Modifiers::ALT, &[Key::ArrowUp])
+            || pressed(brackets, &[Key::OpenBracket, Key::OpenCurlyBracket])
+        {
             -1
         } else {
             0
@@ -174,30 +222,36 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         && !app.show_update
         && app.recording.is_none()
         && !menu_open
-        && ctx.input_mut(|input| {
-            let mut taken = false;
-            input.events.retain(|event| {
-                if taken {
-                    return true;
-                }
-                let matches = matches!(
-                    event,
-                    egui::Event::Key {
-                        key: found,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if *found == Key::ArrowUp && *modifiers == Modifiers::NONE
-                );
-                taken |= matches;
-                !matches
-            });
-            taken
-        });
+        && ctx.input_mut(|input| take_plain(input, Key::ArrowUp));
     if let Some(id) = edit_previous.then(|| app.previous_own_editable()).flatten() {
         actions.push(Action::Edit(id));
     }
     app.actions.extend(actions);
+}
+
+/// Removes this frame's first plain (unmodified) press of `key`, if any, and
+/// reports whether one was found. `consume_key` is unsuitable here: it also
+/// matches the key with Shift or Alt held, and a plain binding must leave
+/// those combinations, such as Shift+Home for text selection, alone.
+fn take_plain(input: &mut egui::InputState, key: Key) -> bool {
+    let mut taken = false;
+    input.events.retain(|event| {
+        if taken {
+            return true;
+        }
+        let matches = matches!(
+            event,
+            egui::Event::Key {
+                key: found,
+                pressed: true,
+                modifiers,
+                ..
+            } if *found == key && *modifiers == Modifiers::NONE
+        );
+        taken |= matches;
+        !matches
+    });
+    taken
 }
 
 /// Handles keys while the image preview is open. No chat shortcut runs, and
@@ -208,6 +262,11 @@ fn preview_keys(app: &mut App, ctx: &egui::Context) {
     ctx.input_mut(|input| {
         if input.consume_key(Modifiers::NONE, Key::Escape) {
             actions.push(Action::CloseImagePreview);
+        }
+        let copy_shortcut = input.consume_key(Modifiers::COMMAND, Key::C)
+            || input.consume_key(Modifiers::CTRL, Key::C);
+        if copy_shortcut && let Some(preview) = &app.image_preview {
+            actions.push(Action::CopyImage(preview.path().to_owned()));
         }
         let mut event_actions = Vec::new();
         for event in &input.events {
@@ -249,6 +308,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ),
     ("Ctrl+L", "Focus the message input"),
     ("Alt+↑ / Alt+↓", "Previous / next chat"),
+    ("Ctrl+Shift+[ / ]", "Previous / next chat, as in WhatsApp"),
     ("↑", "Edit the previous message (when the input is empty)"),
     ("Enter", "Send (Shift+Enter for a new line)"),
     (
@@ -260,8 +320,13 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Ctrl+V",
         "Paste text, or stage a picture from the clipboard",
     ),
-    ("Ctrl+B", "Show or hide the chat list"),
+    ("Ctrl+B", "Collapse or expand the chat list"),
     ("Ctrl+End", "Jump to the newest message"),
+    ("PgUp / PgDn", "Scroll the open chat by a page"),
+    (
+        "Home / End",
+        "Top / bottom of the open chat (when the input is empty)",
+    ),
     ("Ctrl+,", "Settings"),
     ("Ctrl++ / Ctrl+-", "Zoom in / out"),
     ("Ctrl+0", "Reset zoom"),
@@ -273,7 +338,9 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
 /// Uses Command and Option labels on macOS.
 pub fn label(keys: &str) -> String {
     if cfg!(target_os = "macos") {
-        keys.replace("Ctrl", "⌘").replace("Alt", "⌥")
+        keys.replace("Ctrl", "⌘")
+            .replace("Strg", "⌘")
+            .replace("Alt", "⌥")
     } else {
         keys.to_owned()
     }
@@ -466,5 +533,224 @@ mod tests {
         );
         output.textures_delta.clear();
         assert!(matches!(app.actions.as_slice(), [Action::CloseUpdate]));
+    }
+
+    fn app_with_chats(count: usize) -> (tempfile::TempDir, App, Vec<String>) {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        let ids: Vec<String> = (0..count)
+            .map(|index| format!("49170000{index:04}@s.whatsapp.net"))
+            .collect();
+        for (index, id) in ids.iter().enumerate() {
+            let mut chat = Chat::new(id.clone(), format!("Chat {index:02}"));
+            chat.last_activity = 100 - index as i64;
+            app.chats.push(chat);
+        }
+        app.page = Page::Chats;
+        (root, app, ids)
+    }
+
+    /// Runs `handle` on one key press and reports whether the press was left
+    /// for the views, as every press that is not a shortcut must be.
+    fn press(app: &mut App, ctx: &egui::Context, key: Key, modifiers: Modifiers) -> bool {
+        let mut survived = false;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |ui| {
+                handle(app, ui.ctx());
+                survived = ui.ctx().input(|input| {
+                    input.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key {
+                                key: found,
+                                pressed: true,
+                                ..
+                            } if *found == key
+                        )
+                    })
+                });
+            },
+        );
+        output.textures_delta.clear();
+        survived
+    }
+
+    /// The modifiers a real Ctrl+Shift press carries on Linux and Windows,
+    /// and a real Cmd+Shift press on macOS.
+    fn ctrl_shift() -> [Modifiers; 3] {
+        [
+            Modifiers::COMMAND | Modifiers::SHIFT,
+            Modifiers {
+                ctrl: true,
+                command: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                mac_cmd: true,
+                command: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+        ]
+    }
+
+    #[test]
+    fn bracket_shortcuts_step_to_the_previous_and_next_chat() {
+        let (_root, mut app, ids) = app_with_chats(3);
+        app.open_chat = Some(ids[1].clone());
+        let ctx = egui::Context::default();
+        // With Shift held, US-style layouts report the brackets as braces.
+        for modifiers in ctrl_shift() {
+            for (key, expected) in [
+                (Key::CloseBracket, &ids[2]),
+                (Key::CloseCurlyBracket, &ids[2]),
+                (Key::OpenBracket, &ids[0]),
+                (Key::OpenCurlyBracket, &ids[0]),
+            ] {
+                app.actions.clear();
+                app.scroll_chat_into_view = None;
+                let survived = press(&mut app, &ctx, key, modifiers);
+                assert!(!survived, "{key:?} with {modifiers:?} reached the views");
+                assert!(
+                    app.actions.contains(&Action::OpenChat(expected.clone())),
+                    "{key:?} with {modifiers:?} opens {expected}: {:?}",
+                    app.actions
+                );
+                assert_eq!(app.scroll_chat_into_view.as_ref(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn a_bracket_without_ctrl_and_shift_together_stays_typed() {
+        let (_root, mut app, ids) = app_with_chats(3);
+        app.open_chat = Some(ids[1].clone());
+        let ctx = egui::Context::default();
+        let typed = [
+            Modifiers::NONE,
+            Modifiers::SHIFT,
+            Modifiers::COMMAND,
+            Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..Modifiers::NONE
+            },
+            Modifiers::ALT,
+            Modifiers::ALT | Modifiers::SHIFT,
+        ];
+        for modifiers in typed {
+            for key in [
+                Key::OpenBracket,
+                Key::OpenCurlyBracket,
+                Key::CloseBracket,
+                Key::CloseCurlyBracket,
+            ] {
+                app.actions.clear();
+                let survived = press(&mut app, &ctx, key, modifiers);
+                assert!(survived, "{key:?} with {modifiers:?} was consumed");
+                assert!(
+                    !app.actions
+                        .iter()
+                        .any(|action| matches!(action, Action::OpenChat(_))),
+                    "{key:?} with {modifiers:?} switched chats"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_keys_scroll_the_open_chat_and_are_consumed() {
+        let (_root, mut app, ids) = app_with_chats(1);
+        app.open_chat = Some(ids[0].clone());
+        let ctx = egui::Context::default();
+        for (key, expected) in [
+            (Key::PageUp, Action::ScrollPage(Scroll::PageUp)),
+            (Key::PageDown, Action::ScrollPage(Scroll::PageDown)),
+            (Key::Home, Action::ScrollPage(Scroll::Top)),
+            (Key::End, Action::ScrollPage(Scroll::Bottom)),
+        ] {
+            app.actions.clear();
+            let survived = press(&mut app, &ctx, key, Modifiers::NONE);
+            assert!(!survived, "{key:?} reached the views");
+            assert_eq!(
+                app.actions,
+                [expected],
+                "{key:?} did not push the expected action"
+            );
+        }
+    }
+
+    #[test]
+    fn page_keys_leave_shift_and_ctrl_combinations_alone() {
+        let (_root, mut app, ids) = app_with_chats(1);
+        app.open_chat = Some(ids[0].clone());
+        let ctx = egui::Context::default();
+        for (key, modifiers) in [
+            (Key::Home, Modifiers::SHIFT),
+            (Key::PageUp, Modifiers::SHIFT),
+            (Key::Home, Modifiers::COMMAND),
+        ] {
+            app.actions.clear();
+            let survived = press(&mut app, &ctx, key, modifiers);
+            assert!(survived, "{key:?} with {modifiers:?} was consumed");
+            assert!(app.actions.is_empty(), "{key:?} with {modifiers:?} acted");
+        }
+        // Ctrl+End (Cmd+End on macOS) still jumps to the newest message.
+        app.actions.clear();
+        let survived = press(&mut app, &ctx, Key::End, Modifiers::COMMAND);
+        assert!(!survived);
+        assert_eq!(app.actions, [Action::ScrollToBottom]);
+    }
+
+    #[test]
+    fn page_keys_do_nothing_without_an_open_chat_a_dialog_or_off_the_chats_page() {
+        let (_root, mut app, ids) = app_with_chats(1);
+        let ctx = egui::Context::default();
+        let keys = [Key::PageUp, Key::PageDown, Key::Home, Key::End];
+        // No chat open.
+        for key in keys {
+            app.actions.clear();
+            assert!(
+                press(&mut app, &ctx, key, Modifiers::NONE),
+                "{key:?} survived with no chat open"
+            );
+            assert!(app.actions.is_empty());
+        }
+        app.open_chat = Some(ids[0].clone());
+        // A dialog is open.
+        app.dialog = Some(Dialog::Shortcuts);
+        for key in keys {
+            app.actions.clear();
+            assert!(press(&mut app, &ctx, key, Modifiers::NONE));
+            assert!(app.actions.is_empty());
+        }
+        app.dialog = None;
+        // Off the Chats page.
+        app.page = Page::Settings;
+        for key in keys {
+            app.actions.clear();
+            assert!(press(&mut app, &ctx, key, Modifiers::NONE));
+            assert!(app.actions.is_empty());
+        }
     }
 }

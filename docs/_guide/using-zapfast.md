@@ -8,7 +8,8 @@ nav_order: 3
 
 ## Writing
 
-Enter sends and Shift+Enter adds a line. You can swap them in Settings.
+Enter sends and Shift+Enter adds a line. Turn off **Enter sends** in Settings
+to make Enter add a line and send with Ctrl+Enter (Command+Enter on macOS).
 `*bold*`, `_italic_`, `~strike~`, and ```` ```monospace ```` ```` format
 like WhatsApp, and a message of nothing but emoji shows large.
 Mentions in a group are written with `@`; the smiley opens emoji
@@ -27,10 +28,15 @@ on its text still selects the word.
 
 The sticker tab works like WhatsApp's: a row of tabs holds **Recent**
 (the clock), **Favorites** (the star), each of your packs, and **+** for
-adding more. Click a sticker to send it. Animated stickers play on hover.
+adding more. ZapFast adds **Received** (the speech bubble) after Favorites.
+Click a sticker to send it. Animated stickers play on hover.
 
 **Recent** holds the stickers you sent, not the ones you received.
 Right-click one to take it out of Recent here and on your phone.
+
+**Received** holds the stickers people sent you that are already
+downloaded, newest first, each once. Stickers already in Recent or
+Favorites, and stickers from locked chats, stay out of it.
 
 Right-click a sticker in a chat or the picker to add it to your
 **Favorites**. Favorites stay in sync with your phone: a sticker you favorite
@@ -193,7 +199,15 @@ sharing format:
 The search bar finds chats by name, number, or latest message; searches all
 messages stored on this computer; and finds contacts without an existing chat.
 Click a message result to jump to it, or a contact to start a chat. Use
-`Alt+↑/↓` to switch chats without leaving the composer.
+`Alt+↑/↓`, or `Ctrl+Shift+[` and `Ctrl+Shift+]` as in WhatsApp, to switch chats
+without leaving the composer (Command instead of Ctrl on macOS). Within an open
+chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` jump to the top or
+the newest message (when the input is empty).
+
+A shared contact message shows the name from its vCard. When the card names a
+WhatsApp account, **Chat** opens a private conversation with it and, if the
+person is not already in ZapFast's contacts, **Add** saves them, adding them to
+your phone's contacts if you chose that for the last contact you added. A card with only a local number shows the number.
 
 The chips under the search bar narrow the list to **Unread**, **Private**
 (one-to-one chats), or **Groups**. A chip with unread chats shows how many it
@@ -218,21 +232,17 @@ right-click menu lists them, with a checkmark beside the ones the chat wears;
 click one to add or remove it. Deleting a label takes it off every chat and
 nothing else; the chats keep their messages.
 
-Once a label exists, a **Labels** chip leads the chips under the search bar.
-Pick a label from it to list only the chats wearing that label, channels
-included. A label is one more chip: picking it lets go of **Unread** or
-**Groups**, and picking one of those lets go of the label. Like the other
-chips, it does not narrow search or the archive.
+Once a label exists, a row of label chips appears under the other chips, one
+per label, with its colour and the number of unread chats wearing it, followed
+by a **+** that opens the label manager. Pick a label to list only the chats
+wearing it, channels included. A label is one more chip: picking it lets go of
+**Unread** or **Groups**, and picking one of those lets go of the label. Like
+the other chips, it does not narrow search or the archive. Click the active
+label chip again, or **All**, to see every chat.
 
-Turn on **Show labels as chips** in the settings to give each label its own
-chip instead, in a row under the others, with its colour and the number of
-unread chats wearing it, followed by a **+** that opens the label manager.
-Click the active label chip again, or **All**, to see every chat.
-
-The button beside **New chat** hides the list (`Ctrl+B`). Turn on **Collapse the
-chat list to icons** in Settings to keep a narrow column of avatars instead:
-unread chats show their badge, hovering names a chat, clicking opens it, and
-`Ctrl+B` brings the full list back.
+The button beside **New chat** (`Ctrl+B`) collapses the list to a narrow column
+of avatars: unread chats show their badge, hovering names a chat, clicking opens
+it, and `Ctrl+B` brings the full list back.
 
 ## Notifications and the tray
 
@@ -240,10 +250,13 @@ Closing the window keeps ZapFast linked in the tray. Click the tray icon or
 launch the app again to reopen it. Launchers that support the Unity Launcher API
 show the unread count as a badge on the app icon: KDE Plasma's taskbar, with
 **Show badges** enabled in the Task Manager settings, and GNOME's Dash to Dock
-or Dash to Panel. On Linux and Windows, notifications show the chat picture
-and open the chat at the message they announced when clicked. Muted chats do not
-send notifications, and archived chats stay quiet until you unarchive them. You
-can change both settings.
+or Dash to Panel. Windows overlays a compact unread-message count on ZapFast's
+taskbar button while the window is open, using `99+` above 99. Windows must use
+its regular taskbar icon size for overlays to appear. The count
+does not count toasts remaining in Windows notification history. On Linux and
+Windows, notifications show the chat picture and open the chat at the message
+they announced when clicked. Muted chats do not send notifications, and
+archived chats stay quiet until you unarchive them. You can change both settings.
 
 Press `Ctrl+/` or click the keyboard button under the composer to list all
 shortcuts.

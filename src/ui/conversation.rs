@@ -10,11 +10,11 @@ use egui::{
 };
 
 use crate::animation;
-use crate::app::{App, Conversation, JumpHighlight, RowHeight};
+use crate::app::{App, Conversation, JumpHighlight, KeyScroll, RowHeight};
 use crate::markup;
 use crate::model::{
     Action, Chat, ChatId, Content, Delivery, Dialog, LinkPreview, Media, MediaState, Message,
-    PickerTab,
+    PickerTab, Scroll,
 };
 use crate::theme::{self, Icon, Palette};
 use crate::wallpaper;
@@ -25,6 +25,8 @@ use super::widgets;
 /// Group-message avatar size.
 const SENDER_AVATAR: f32 = 28.0;
 const BODY_SIZE: f32 = 14.5;
+/// Extra space above the first message of a run from one side.
+const RUN_GAP: f32 = 5.0;
 /// Footer label on an outgoing message that failed to send.
 const NOT_SENT: &str = "Not sent";
 const NOT_SENT_HINT: &str =
@@ -32,22 +34,27 @@ const NOT_SENT_HINT: &str =
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let Some(chat) = app.current_chat().cloned() else {
-        super::standalone_header(app, ui);
         if theme::macos_chrome(ui.ctx()) {
             super::banner(app, ui);
         }
         empty(app, ui);
         return;
     };
-    if app.settings.show_wallpaper {
-        wallpaper::paint(ui, app.settings.wallpaper_color_for(app.palette.dark));
-    }
-    header(app, ui, &chat);
+    wallpaper::paint(ui, &app.wallpaper());
+    let header = header(app, ui, &chat);
     if theme::macos_chrome(ui.ctx()) {
         super::banner(app, ui);
     }
     composer(app, ui, &chat);
     messages(app, ui, &chat);
+    // Over the messages, which scroll under the header.
+    widgets::paint_shadow_below(
+        ui,
+        &app.palette,
+        header.left(),
+        header.right(),
+        header.bottom(),
+    );
 }
 
 fn empty(app: &mut App, ui: &mut egui::Ui) {
@@ -93,12 +100,9 @@ fn empty(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
+fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
     let palette = app.palette;
     let title = app.chat_title(chat);
-    // The collapsed list has its own show button and clears the traffic
-    // lights itself; only a fully hidden list leaves both to the header.
-    let sidebar_hidden = app.sidebar_mode() == crate::model::SidebarDisplayMode::Hidden;
     egui::Panel::top("chat-header")
         .show_separator_line(false)
         .frame(
@@ -107,33 +111,13 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .inner_margin(Margin::symmetric(14, 8)),
         )
         .show(ui, |ui| {
+            // The chat list, expanded or collapsed, clears the traffic lights.
             if theme::macos_chrome(ui.ctx()) {
-                let mut drag = ui.max_rect();
-                if sidebar_hidden {
-                    drag.min.x += theme::traffic_light_inset(ui.ctx());
-                }
-                super::titlebar_drag(ui, drag);
+                super::titlebar_drag(ui, ui.max_rect());
             }
             ui.horizontal(|ui| {
                 // Give both rows a fixed height so their contents align.
                 ui.set_min_height(HEADER_ROW);
-                if sidebar_hidden && theme::macos_chrome(ui.ctx()) {
-                    ui.add_space((theme::traffic_light_inset(ui.ctx()) - 14.0).max(0.0));
-                }
-                if sidebar_hidden
-                    && theme::icon_button(
-                        ui,
-                        Icon::PanelLeft,
-                        18.0,
-                        palette.secondary,
-                        palette.text,
-                        "Show the chat list (Ctrl+B)",
-                    )
-                    .tab_stop(Stop::Sidebar)
-                    .clicked()
-                {
-                    app.actions.push(Action::ToggleSidebar);
-                }
                 let picture = app.avatar(&chat.id);
                 let (subtitle, color) = subtitle(app, chat);
                 let right_controls = 72.0;
@@ -242,12 +226,18 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             "Info",
                             "Pin to top",
                             "Unarchive",
+                            "Clear chat",
                             leave_label.as_ref(),
                             "Copy number",
                             "Close chat",
                         ],
                         true,
                     );
+                    // Demo/test: hold this menu open for a screenshot.
+                    #[cfg(any(test, feature = "demo"))]
+                    if app.open_header_menu.as_deref() == Some(chat.id.as_str()) {
+                        egui::Popup::open_id(ui.ctx(), more.id.with("popup"));
+                    }
                     egui::Popup::menu(&more)
                         .width(width)
                         .frame(widgets::menu_frame(&palette))
@@ -277,6 +267,20 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             ) {
                                 app.actions
                                     .push(Action::SetArchived(chat.id.clone(), !chat.archived));
+                            }
+                            // Clearing reaches the phone, so it waits for a
+                            // connection, as deleting does in the chat list.
+                            if widgets::menu_item_enabled(
+                                ui,
+                                &palette,
+                                Some(Icon::Eraser),
+                                "Clear chat",
+                                app.is_connected(),
+                            ) {
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::ConfirmClearChat(
+                                        chat.id.clone(),
+                                    )));
                             }
                             widgets::menu_separator(ui, &palette);
                             if chat.can_leave(&app.our_ids())
@@ -330,7 +334,9 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     }
                 });
             });
-        });
+        })
+        .response
+        .rect
 }
 
 /// Chat-header subtitle.
@@ -891,7 +897,9 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 pending_strip(app, ui);
             }
             if app.recording.is_some() {
-                composer_pill(&palette).show(ui, |ui| recording_strip(app, ui));
+                widgets::raised(ui, &palette, composer_pill(&palette), |ui| {
+                    recording_strip(app, ui)
+                });
                 return;
             }
             emoji_suggestions(app, ui, id);
@@ -937,18 +945,33 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .max(COMPOSER_CONTROL);
             let button_width = line;
             let field_margin = ((line - line_height) / 2.0).round().max(0.0);
+            // Measure this frame's draft at the text column's width, so the
+            // field and the panel holding it grow on the keystroke that wraps
+            // a line rather than a frame later, which made them jump.
+            let wrap_id = id.with("wrap");
             let text_height = ui
                 .ctx()
-                .read_response(id)
-                .map(|previous| previous.rect.height())
+                .data(|data| data.get_temp::<f32>(wrap_id))
+                .map(|wrap| {
+                    let format =
+                        egui::TextFormat::simple(theme::regular(BODY_SIZE), palette.text);
+                    crate::bidi::layout_editor(ui, &app.composer, &format, wrap, true)
+                        .0
+                        .size()
+                        .y
+                })
+                .or_else(|| ui.ctx().read_response(id).map(|previous| previous.rect.height()))
                 .unwrap_or(line_height)
                 .clamp(line_height, line_height * 6.0);
             let row_height = (text_height + 2.0 * field_margin).max(line);
-            let pill = composer_pill(&palette).show(ui, |ui| {
+            let pill = widgets::raised(ui, &palette, composer_pill(&palette), |ui| {
             ui.allocate_ui_with_layout(
                 vec2(ui.available_width(), row_height),
                 Layout::left_to_right(Align::Max),
                 |ui| {
+                // The plus sits in the field's rounded left end, centred as
+                // the send button is in the right one.
+                ui.add_space((line / 2.0 - PLUS_EDGE / 2.0).max(0.0));
                 if app.editing.is_none() {
                     let tools = last_line(ui, line, |ui| theme::icon_button(
                         ui,
@@ -985,27 +1008,47 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         }
                         app.actions.push(Action::TogglePicker(PickerTab::Emoji));
                     }
+                    // The text follows the pair as closely as the emoji
+                    // follows the plus (the field's own left margin included).
+                    ui.add_space(COMPOSER_TEXT_GAP - ui.spacing().item_spacing.x - 8.0);
                 }
-                let field_width = (ui.available_width() - button_width - 10.0).max(0.0);
+                // The send button closes the row, flush with the field's end.
+                let field_width =
+                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(0.0);
+                // The ink is centred on the controls, not the line box: the
+                // span from a capital's top to a descender's bottom sits as far
+                // from the field's top as from its bottom. Inter's box leaves
+                // more room above the capitals than below the descenders, and
+                // at fractional scales the glyphs round to the pixel grid off
+                // centre in it. Measured at this scale, snapped to a pixel.
+                let ink_middle = ink_middle(ui, line_height);
+                let top = fastframe_text::snap_to_pixels(
+                    row_height - line / 2.0 - (text_height - line_height) - ink_middle,
+                    ui.ctx().pixels_per_point(),
+                )
+                .max(0.0);
+                let bottom = (row_height - text_height - top).max(0.0);
                 Frame::new()
                     .fill(Color32::TRANSPARENT)
-                    // One point higher than the geometric centre: most lines
-                    // have letters that drop below the baseline, which makes a
-                    // centred line look low.
                     .inner_margin(Margin {
                         left: 8,
                         right: 8,
-                        top: (field_margin - 1.0).max(0.0) as i8,
-                        bottom: (field_margin + 1.0) as i8,
+                        top: 0,
+                        bottom: 0,
                     })
                     .show(ui, |ui| {
                         ui.set_width((field_width - 16.0).max(0.0));
-                        // Grow from one to six lines, then scroll.
+                        ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add_space(top);
+                        // Grow from one to six lines, then scroll. The height
+                        // is this frame's draft, measured above, rather than
+                        // the scroll area's memory of the last frame.
                         egui::ScrollArea::vertical()
                             .id_salt("composer-scroll")
-                            .max_height(line_height * 6.0)
-                            .min_scrolled_height(0.0)
-                            .auto_shrink([false, true])
+                            .max_height(text_height)
+                            .min_scrolled_height(text_height)
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 // Keep emoji in the buffer so character offsets match, then
                                 // paint their color bitmaps over the transparent glyphs.
@@ -1028,6 +1071,8 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                     clusters = found;
                                     galley
                                 };
+                                let wrap = ui.available_width();
+                                ui.ctx().data_mut(|data| data.insert_temp(wrap_id, wrap));
                                 let output = egui::TextEdit::multiline(&mut app.composer)
                                     .id(id)
                                     .frame(Frame::NONE)
@@ -1073,6 +1118,35 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                     }
                                     let rect = bounds.translate(output.galley_pos.to_vec2());
                                     crate::emoji::paint_cluster(ui, cluster, rect);
+                                }
+                                // The row was sized from last frame's text. When a
+                                // keystroke wraps or unwraps a line, lay the frame
+                                // out again instead of showing the field a frame
+                                // late, which made it jump while typing.
+                                // egui sizes the box before applying the keystroke,
+                                // and text typed into an empty field reaches its
+                                // galley a frame later still, so measure the
+                                // edited draft itself.
+                                let painted = Rect::from_min_size(
+                                    output.galley_pos,
+                                    output.galley.size(),
+                                );
+                                let measured = crate::bidi::layout_editor(
+                                    ui,
+                                    &app.composer,
+                                    &format,
+                                    wrap,
+                                    true,
+                                )
+                                .0
+                                .size()
+                                .y
+                                .clamp(line_height, line_height * 6.0);
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(composer_text_id(), painted);
+                                });
+                                if (measured - text_height).abs() > 0.5 {
+                                    ui.ctx().request_discard("composer height changed");
                                 }
                                 let response = output.response.response.clone().tab_stop(Stop::Composer);
                                 ui.ctx().accesskit_node_builder(response.id, |node| node.set_label("Message"));
@@ -1134,6 +1208,8 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                     response.request_focus();
                                 }
                             });
+                        ui.add_space(bottom);
+                        });
                     });
                 let ready = !app.composer.trim().is_empty()
                     || !app.pending.is_empty()
@@ -1216,11 +1292,11 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         13.0,
                         palette.dim,
                         palette.secondary,
-                        crate::i18n::gettext(app.locale, "Hide shortcut hints (restore in Settings)").as_ref(),
+                        crate::i18n::gettext(app.locale, "Hide shortcut hints (bring them back from Keyboard shortcuts)").as_ref(),
                     )
                     .clicked()
                     {
-                        app.actions.push(Action::HideShortcutHints);
+                        app.actions.push(Action::SetShortcutHints(false));
                     }
                     theme::text(ui, &hint, theme::regular(11.0), palette.dim);
                     // Open the shortcut list without consuming typed `?`.
@@ -1242,6 +1318,19 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 });
             }
         });
+    // A bottom panel is placed from last frame's height. When the composer
+    // grows or shrinks, lay the frame out again so it never shows the field
+    // hanging below the window or a gap above it for a frame.
+    let height = shown.response.rect.height();
+    let height_id = egui::Id::new("composer-panel-height");
+    let previous = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<f32>(height_id);
+        data.insert_temp(height_id, height);
+        previous
+    });
+    if previous.is_some_and(|previous| (previous - height).abs() > 0.5) {
+        ui.ctx().request_discard("composer height changed");
+    }
     // Toasts sit above the composer so they never cover its buttons.
     ui.ctx()
         .data_mut(|data| data.insert_temp(super::composer_rect_id(), shown.response.rect));
@@ -1256,12 +1345,54 @@ const COMPOSER_PADDING: f32 = 14.0;
 /// Height of the plus and emoji buttons: a row is never shorter, or they
 /// would stretch it and pull the text off its centre.
 const COMPOSER_CONTROL: f32 = 36.0;
-/// Space between the plus and emoji buttons.
-const COMPOSER_PAIR_GAP: f32 = 2.0;
+/// Space between the composer's rounded field and the buttons at its ends.
+const COMPOSER_INSET: i8 = 2;
+/// Space between the plus and emoji buttons' hit areas. Each area pads its
+/// 22-point icon by six points a side, so this leaves eight between the
+/// icons, a pair.
+const COMPOSER_PAIR_GAP: f32 = -4.0;
+/// From the emoji button's edge to the text. The plus's glyph leaves more of
+/// its box empty than the round emoji's, so this is wider than the pair's
+/// gap: at it, the text starts as far from the emoji's ink as the emoji
+/// starts from the plus's.
+pub(crate) const COMPOSER_TEXT_GAP: f32 = 6.0;
+/// Width of the plus button: its 22-point icon and `icon_button`'s padding.
+const PLUS_EDGE: f32 = 34.0;
+
+/// Where the composer's text was painted in the frame's last pass, for
+/// layout tests.
+pub(crate) fn composer_text_id() -> egui::Id {
+    egui::Id::new("composer-text-rect")
+}
 
 /// Where the composer's rounded field was drawn, for layout tests.
 pub(crate) fn composer_pill_id() -> egui::Id {
     egui::Id::new("composer-pill")
+}
+
+/// The open chat's message list scroll offset and viewport height, as
+/// `(offset.y, height)`, as of its last frame: for tests that need them
+/// precisely. `App::at_bottom` covers ordinary UI checks.
+pub(crate) fn scroll_metrics_id(chat: &ChatId) -> egui::Id {
+    egui::Id::new(("message-scroll-metrics", chat))
+}
+
+/// How far below the top of a composer text row the middle of its ink sits,
+/// at this scale: halfway from a capital's top to a descender's bottom.
+fn ink_middle(ui: &egui::Ui, line_height: f32) -> f32 {
+    let format = egui::TextFormat::simple(theme::regular(BODY_SIZE), Color32::WHITE);
+    let (galley, _) = crate::bidi::layout_editor(ui, "Hy", &format, f32::INFINITY, true);
+    galley
+        .rows
+        .first()
+        .and_then(|row| {
+            let [capital, descender] = [row.glyphs.first()?, row.glyphs.get(1)?];
+            let top = capital.pos.y + capital.uv_rect.offset.y;
+            let bottom = descender.pos.y + descender.uv_rect.offset.y + descender.uv_rect.size.y;
+            (!capital.uv_rect.is_nothing() && !descender.uv_rect.is_nothing())
+                .then(|| row.pos.y + (top + bottom) / 2.0)
+        })
+        .unwrap_or(line_height / 2.0)
 }
 
 /// Lays out a control centred in the composer's last-line band, however
@@ -1276,13 +1407,14 @@ fn composer_pill(palette: &Palette) -> Frame {
     Frame::new()
         .fill(palette.surface)
         .corner_radius(CornerRadius::same(COMPOSER_RADIUS))
-        .shadow(egui::epaint::Shadow {
-            offset: [0, 0],
-            blur: 6,
-            spread: 0,
-            color: Color32::from_black_alpha(31),
+        // The end buttons are inset by as much at the sides as above and
+        // below, so they sit evenly in the rounded ends.
+        .inner_margin(Margin {
+            left: COMPOSER_INSET,
+            right: COMPOSER_INSET,
+            top: COMPOSER_INSET,
+            bottom: COMPOSER_INSET,
         })
-        .inner_margin(Margin::symmetric(8, 2))
 }
 
 /// The plus menu beside the composer: send files or create a poll.
@@ -1322,6 +1454,15 @@ fn composer_tools_menu(app: &mut App, chat: &Chat, plus: &egui::Response) {
 }
 
 /// Offers a refused voice message for another try, or to discard it.
+/// From a strip above the composer (reply, edit, unsent voice) to the field
+/// it belongs to: close enough to read as one piece.
+pub(crate) const STRIP_GAP: f32 = 3.0;
+
+/// Leaves [`STRIP_GAP`] below a strip, the layout's own spacing included.
+fn strip_gap(ui: &mut egui::Ui) {
+    ui.add_space(STRIP_GAP - ui.spacing().item_spacing.y);
+}
+
 fn unsent_voice_strip(app: &mut App, ui: &mut egui::Ui, samples: usize) {
     let palette = app.palette;
     let seconds = (samples as f64 / f64::from(crate::voice::RATE))
@@ -1330,11 +1471,14 @@ fn unsent_voice_strip(app: &mut App, ui: &mut egui::Ui, samples: usize) {
     let label = crate::i18n::gettext(app.locale, "Voice message ({duration}) not sent")
         .replace("{duration}", &crate::util::duration(seconds));
     let discard = crate::i18n::gettext(app.locale, "Discard voice message");
-    Frame::new()
-        .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
+    widgets::raised(
+        ui,
+        &palette,
+        Frame::new()
+            .fill(palette.surface)
+            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .inner_margin(Margin::symmetric(10, 6)),
+        |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 theme::icon(ui, Icon::Mic, 16.0, palette.danger);
@@ -1357,17 +1501,21 @@ fn unsent_voice_strip(app: &mut App, ui: &mut egui::Ui, samples: usize) {
                     }
                 });
             });
-        });
-    ui.add_space(6.0);
+        },
+    );
+    strip_gap(ui);
 }
 
 fn edit_strip(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    Frame::new()
-        .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
+    widgets::raised(
+        ui,
+        &palette,
+        Frame::new()
+            .fill(palette.surface)
+            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .inner_margin(Margin::symmetric(10, 6)),
+        |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 theme::icon(ui, Icon::Pencil, 16.0, palette.accent);
@@ -1387,8 +1535,9 @@ fn edit_strip(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             });
-        });
-    ui.add_space(6.0);
+        },
+    );
+    strip_gap(ui);
 }
 
 fn reply_strip(app: &mut App, ui: &mut egui::Ui, quoted: &Message) {
@@ -1399,11 +1548,14 @@ fn reply_strip(app: &mut App, ui: &mut egui::Ui, quoted: &Message) {
         app.display_name_or(&quoted.sender, quoted.sender_name.as_deref())
     };
     let summary = markup::plain(&quoted.summary(), &app.mention_list(quoted));
-    Frame::new()
-        .fill(palette.surface)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
+    let strip = widgets::raised(
+        ui,
+        &palette,
+        Frame::new()
+            .fill(palette.surface)
+            .corner_radius(CornerRadius::same(theme::RADIUS))
+            .inner_margin(Margin::symmetric(10, 6)),
+        |ui| {
             ui.set_width(ui.available_width().max(0.0));
             ui.horizontal(|ui| {
                 let (bar, _) = ui.allocate_exact_size(vec2(3.0, 34.0), Sense::hover());
@@ -1434,8 +1586,16 @@ fn reply_strip(app: &mut App, ui: &mut egui::Ui, quoted: &Message) {
                     }
                 });
             });
-        });
-    ui.add_space(6.0);
+        },
+    );
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(reply_strip_id(), strip.response.rect));
+    strip_gap(ui);
+}
+
+/// Where the reply strip was drawn, for layout tests.
+pub(crate) fn reply_strip_id() -> egui::Id {
+    egui::Id::new("reply-strip")
 }
 
 /// App data needed while drawing a checked-out conversation.
@@ -1448,8 +1608,6 @@ struct View<'a> {
     connected: bool,
     poll_voting: &'a HashSet<(ChatId, String)>,
     interactive_pending: &'a HashSet<(ChatId, String)>,
-    /// Show avatars for all incoming messages, not only groups.
-    pictures: bool,
     anchor: Option<&'a str>,
     /// Demo/test: keep this message's context menu open.
     open_menu: Option<&'a str>,
@@ -1463,6 +1621,7 @@ struct View<'a> {
     /// Resolves mention names without replacing our name with "You".
     mention_names: &'a dyn Fn(&str) -> String,
     avatars: &'a HashMap<String, Option<PathBuf>>,
+    contacts: &'a HashMap<String, crate::model::Contact>,
     now: i64,
     /// Animate media only while this window is active.
     animate: bool,
@@ -1505,13 +1664,25 @@ fn estimated_height(message: &Message, width: f32, new_day: bool) -> f32 {
     40.0 + body + if new_day { 36.0 } else { 0.0 }
 }
 
+/// Incoming messages carry their sender's picture and name in groups only,
+/// as on WhatsApp.
+fn shows_sender_pictures(chat: &Chat) -> bool {
+    chat.is_group()
+}
+
 fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let palette = app.palette;
+    // Taken up front: `names_or` below borrows the rest of `app` for the
+    // whole function, so a pending scroll must come out before that.
+    let pending_scroll = app.scroll_page.take();
+    // An explicit jump (Ctrl+End, or the return-to-bottom button) must reach
+    // the bottom even while a message bubble retains keyboard focus.
+    let scroll_forced = std::mem::take(&mut app.scroll_to_bottom_forced);
     // Check out the conversation while drawing rows and collecting actions.
     let mut conversation = app.conversations.remove(&chat.id).unwrap_or_default();
     let typing = app.typing_in(&chat.id);
     let mut avatars = HashMap::new();
-    if chat.is_group() || app.settings.show_sender_pictures {
+    if shows_sender_pictures(chat) {
         let mut senders: HashSet<String> = conversation
             .messages
             .iter()
@@ -1537,7 +1708,6 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         connected: app.link.is_connected(),
         poll_voting: &app.poll_voting,
         interactive_pending: &app.interactive_sending,
-        pictures: app.settings.show_sender_pictures,
         anchor: if conversation.loading_older || conversation.fetching_phone {
             None
         } else {
@@ -1555,6 +1725,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         names_or: &names_or,
         mention_names: &mention_names,
         avatars: &avatars,
+        contacts: &app.contacts,
         now: crate::util::now(),
         animate: app.window_focused,
         player: &app.player,
@@ -1585,7 +1756,6 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
         .map(|(_, ids)| ids.clone());
     let scroll_to_bottom =
         app.scroll_to_bottom && divider.as_ref().is_none_or(|(.., placed)| *placed);
-    let app_pictures = app.settings.show_sender_pictures;
     // The message a quote or search result jumped to flashes once in view.
     let jump = app
         .jump_highlight
@@ -1594,7 +1764,8 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     let jump_since = std::cell::Cell::new(jump.as_ref().and_then(|jump| jump.since));
     let time = ui.input(|input| input.time);
     // Do not animate programmatic scrolling. Pending animations can delay a
-    // later request to reach the end.
+    // later request to reach the end. Keyboard page, Home, and End scrolls
+    // ease by applying small instant steps each frame instead (`KeyScroll`).
     let mut edge_scrolled_up = false;
     // Rows far from the viewport are skipped rather than laid out, keeping the
     // height they last took (or an estimate), so a long history costs the rows
@@ -1627,6 +1798,39 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     // follows, so what the reader looks at stays put while rows scrolled past
     // are measured for the first time.
     let mut grew_above = 0.0;
+    // The offset the message list is about to load, the distance a Home
+    // scroll still has to cover: the same id the `ScrollArea` below loads.
+    // `.id_salt()` hashes its salt into an `IdSalt` before combining it with
+    // the `Ui`'s id, so the salt must go through the same `IdSalt::new` here
+    // to land on the same id.
+    let scroll_id = ui.make_persistent_id(egui::IdSalt::new(("messages", &chat.id)));
+    let offset =
+        egui::scroll_area::State::load(ui.ctx(), scroll_id).map_or(0.0, |state| state.offset.y);
+    // A keyboard scroll under way stops for a jump to a message, for the
+    // reaction bar, which holds the view still, and for a wheel or trackpad
+    // turn over the message list, before it takes another step.
+    let mut key_scroll = conversation.key_scroll.take();
+    let list = ui.available_rect_before_wrap();
+    let wheel_over_list = ui.input(|input| {
+        (input.smooth_scroll_delta.y != 0.0
+            || input
+                .raw
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::MouseWheel { .. })))
+            && input
+                .pointer
+                .hover_pos()
+                .is_some_and(|pos| list.contains(pos))
+    });
+    if view.anchor.is_some() || view.reaction.is_some() || wheel_over_list {
+        key_scroll = None;
+    }
+    let key_duration = ui.style().scroll_animation.duration.max;
+    // A key scroll starts one frame back, so it moves on its first frame and
+    // a held key's repeats, which restart it, never stall it.
+    let key_start = time - f64::from(ui.input(|input| input.stable_dt.min(0.1)));
+    let mut pinned = false;
     let output = egui::ScrollArea::vertical()
         .id_salt(("messages", &chat.id))
         .auto_shrink([false, false])
@@ -1660,6 +1864,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     if delta < 0.0 {
                         edge_scrolled_up = true;
                     }
+                    key_scroll = None;
                     ui.scroll_with_delta_animation(
                         vec2(0.0, -delta),
                         egui::style::ScrollAnimation::none(),
@@ -1751,17 +1956,28 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                             }
                             ui.add_space(4.0);
                         }
-                        let show_sender = (chat.is_group() || app_pictures)
+                        let show_sender = shows_sender_pictures(chat)
                             && !message.from_me
                             && (new_day
                                 || previous.is_none_or(|previous| {
                                     previous.sender != message.sender || previous.from_me
                                 }));
+                        // The first message of a run from one side, as the
+                        // phone draws it: a little apart, with a tail.
+                        let first_in_run = new_day
+                            || previous.is_none_or(|previous| {
+                                previous.from_me != message.from_me
+                                    || (!message.from_me && previous.sender != message.sender)
+                            });
+                        if first_in_run && !new_day && previous.is_some() {
+                            ui.add_space(RUN_GAP);
+                        }
                         let flash = jump
                             .as_ref()
                             .filter(|jump| jump.message == message.id)
                             .map(|_| (ui.painter().add(egui::Shape::Noop), ui.cursor().top()));
-                        let response = bubble(ui, &view, message, show_sender, &mut actions);
+                        let response =
+                            bubble(ui, &view, message, show_sender, first_in_run, &mut actions);
                         if let Some((slot, top)) = flash {
                             if view.anchor == Some(message.id.as_str()) && response.is_some() {
                                 jump_since.set(Some(time));
@@ -1837,17 +2053,75 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         typing_bubble(ui, &view, &typing);
                     }
                     ui.add_space(4.0);
-                    if scroll_to_bottom && !keyboard_navigation.get() && view.reaction.is_none() {
+                    // An explicit jump (Ctrl+End, or the return-to-bottom
+                    // button) wins over a message bubble's retained keyboard
+                    // focus; other triggers still defer to it, so an
+                    // automatic pin does not pull the view away from what a
+                    // keyboard-navigating reader is looking at.
+                    if scroll_to_bottom
+                        && (scroll_forced || !keyboard_navigation.get())
+                        && view.reaction.is_none()
+                    {
                         ui.scroll_to_rect_animation(
                             Rect::from_min_size(ui.cursor().min, Vec2::ZERO),
                             None,
                             egui::style::ScrollAnimation::none(),
                         );
+                        pinned = true;
                     }
                 });
+            // A keyboard PgUp/PgDn/Home/End scroll moves by the next slice of
+            // its eased distance each frame, as an instant scroll: relative
+            // steps compose with the row-height compensation below, and
+            // `scroll_with_delta` releases stick-to-bottom like edge-scroll
+            // above. An instant jump to the end this frame wins over it.
+            if pinned {
+                key_scroll = None;
+            } else if let Some(kind) = pending_scroll
+                && view.reaction.is_none()
+            {
+                // A repeated page key adds a page to the distance left, so a
+                // held key keeps moving; anything else starts over.
+                let page = match kind {
+                    Scroll::PageUp => viewport.height() * 0.9,
+                    Scroll::PageDown => -(viewport.height() * 0.9),
+                    Scroll::Top | Scroll::Bottom => 0.0,
+                };
+                let left = key_scroll
+                    .filter(|scroll| scroll.kind == kind)
+                    .map_or(0.0, |scroll| scroll.remaining);
+                key_scroll = Some(KeyScroll::new(kind, left + page, key_start, key_duration));
+            }
+            if let Some(scroll) = &mut key_scroll {
+                let fraction = scroll.advance(time);
+                let step = match scroll.kind {
+                    Scroll::PageUp | Scroll::PageDown => {
+                        let step = scroll.remaining * fraction;
+                        scroll.remaining -= step;
+                        step
+                    }
+                    Scroll::Top => offset * fraction,
+                    // Measured again every frame, so messages that arrive
+                    // on the way are included.
+                    Scroll::Bottom => {
+                        -(ui.min_rect().bottom() - viewport.bottom()).max(0.0) * fraction
+                    }
+                };
+                ui.scroll_with_delta_animation(
+                    vec2(0.0, step),
+                    egui::style::ScrollAnimation::none(),
+                );
+                ui.ctx().request_repaint();
+            }
         });
     let at_bottom =
         output.state.offset.y + output.inner_rect.height() >= output.content_size.y - 24.0;
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            scroll_metrics_id(&chat.id),
+            (output.state.offset.y, output.inner_rect.height()),
+        );
+    });
     // Keep the view at the end while initial content expands, until the user
     // scrolls with the wheel, trackpad, or scrollbar.
     let bar = Rect::from_min_max(
@@ -1875,18 +2149,39 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
     // Keep the rows on screen where they were when rows above them changed
     // height, unless this frame scrolled on purpose (to the end, a jump, or
     // the divider) or sticks to the end, where egui keeps the offset anyway.
-    // The pass is redone at the new offset, so the shift never shows.
-    if grew_above.abs() >= 0.5 && !lay_out_all && !scroll_to_bottom && !at_bottom {
+    // Home targets an absolute offset (0), so it is skipped while Home
+    // scrolls, rather than pushing the offset away from the top; PgUp/PgDn
+    // steps are relative and still get it. The pass is redone at the new
+    // offset, so the shift never shows.
+    if grew_above.abs() >= 0.5
+        && !lay_out_all
+        && !scroll_to_bottom
+        && !at_bottom
+        && key_scroll.is_none_or(|scroll| scroll.kind != Scroll::Top)
+    {
         let mut state = output.state;
         state.offset.y = (state.offset.y + grew_above).max(0.0);
         state.store(ui.ctx(), output.id);
         ui.ctx()
             .request_discard("transcript rows above the viewport changed height");
     }
+    if reader_scrolled {
+        key_scroll = None;
+    }
+    if let Some(scroll) = key_scroll
+        && scroll.done()
+    {
+        key_scroll = None;
+        if scroll.kind == Scroll::Bottom {
+            // Keep later messages pinned, as Ctrl+End already does.
+            app.scroll_to_bottom = true;
+        }
+    }
+    conversation.key_scroll = key_scroll;
     app.conversations
         .insert(chat.id.clone(), std::mem::take(&mut conversation));
     app.at_bottom = at_bottom;
-    if app.scroll_to_bottom && (reader_scrolled || keyboard_navigation.get()) {
+    if app.scroll_to_bottom && (reader_scrolled || (keyboard_navigation.get() && !scroll_forced)) {
         app.scroll_to_bottom = false;
     }
     if divider_placed {
@@ -2029,7 +2324,7 @@ fn top_of_history(
 fn typing_bubble(ui: &mut egui::Ui, view: &View<'_>, typers: &[(String, String)]) {
     let palette = view.palette;
     ui.horizontal(|ui| {
-        if view.chat.is_group() || view.pictures {
+        if shows_sender_pictures(view.chat) {
             let count = typers.len().min(3);
             let step = SENDER_AVATAR * 0.6;
             let width = SENDER_AVATAR + step * (count.saturating_sub(1)) as f32;
@@ -2060,11 +2355,16 @@ fn typing_bubble(ui: &mut egui::Ui, view: &View<'_>, typers: &[(String, String)]
             }
             ui.add_space(2.0);
         }
-        Frame::new()
-            .fill(palette.bubble_in)
-            .corner_radius(CornerRadius::same(10))
+        let backdrop = ui.painter().add(egui::Shape::Noop);
+        let rect = Frame::new()
             .inner_margin(Margin::symmetric(12, 9))
-            .show(ui, |ui| typing_dots(ui, &palette));
+            .show(ui, |ui| typing_dots(ui, &palette))
+            .response
+            .rect;
+        ui.painter().set(
+            backdrop,
+            widgets::bubble_shape(&palette, rect, palette.bubble_in, Some(widgets::Side::Left)),
+        );
     });
 }
 
@@ -2079,8 +2379,9 @@ fn typing_dots(ui: &mut egui::Ui, palette: &Palette) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(100));
+    // Every frame, paced by vsync like egui's own animations; drawn only
+    // while visible, and a hidden window gets no frames at all.
+    ui.ctx().request_repaint();
     let time = ui.input(|input| input.time);
     for index in 0..3 {
         let wave = ((time * std::f64::consts::TAU / 1.2) - f64::from(index) * 0.9).sin() as f32;
@@ -2284,6 +2585,7 @@ fn bubble(
     view: &View<'_>,
     message: &Message,
     show_sender: bool,
+    first_in_run: bool,
     actions: &mut Vec<Action>,
 ) -> Option<egui::Response> {
     let own = message.from_me;
@@ -2292,7 +2594,7 @@ fn bubble(
         palette: view.palette.on_bubble(own),
         ..*view
     };
-    let with_avatar = !own && (view.chat.is_group() || view.pictures);
+    let with_avatar = !own && shows_sender_pictures(view.chat);
     let carousel = matches!(&message.content, Content::Interactive { card: Some(card), .. } if !card.carousel.is_empty());
     let max_width = ((ui.available_width() * if carousel { 0.95 } else { 0.72 })
         .min(if carousel { 920.0 } else { 560.0 })
@@ -2353,6 +2655,7 @@ fn bubble(
                             view,
                             message,
                             show_sender,
+                            first_in_run,
                             max_width,
                             actions,
                         ));
@@ -2364,6 +2667,7 @@ fn bubble(
                     view,
                     message,
                     show_sender,
+                    first_in_run,
                     max_width,
                     actions,
                 ));
@@ -2677,6 +2981,7 @@ fn bubble_frame(
     view: &View<'_>,
     message: &Message,
     show_sender: bool,
+    first_in_run: bool,
     max_width: f32,
     actions: &mut Vec<Action>,
 ) -> egui::Response {
@@ -2703,9 +3008,14 @@ fn bubble_frame(
     let rect_id = bubble_id.with("rect");
     let previous = ui.ctx().data(|data| data.get_temp::<Rect>(rect_id));
     let early = previous.map(|rect| ui.interact(rect, bubble_id, Sense::CLICK));
+    // Painted once the contents are measured, beneath them.
+    let backdrop = ui.painter().add(egui::Shape::Noop);
+    let tail = (first_in_run && fill != Color32::TRANSPARENT).then_some(if own {
+        widgets::Side::Right
+    } else {
+        widgets::Side::Left
+    });
     let inner = Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin {
             left: 10,
             right: 10,
@@ -2786,6 +3096,12 @@ fn bubble_frame(
                 interactive_buttons(ui, view, message, card, settled.unwrap_or(cap), actions);
             }
         });
+    if fill != Color32::TRANSPARENT && ui.is_rect_visible(inner.response.rect) {
+        ui.painter().set(
+            backdrop,
+            widgets::bubble_shape(&palette, inner.response.rect, fill, tail),
+        );
+    }
     ui.ctx()
         .data_mut(|data| data.insert_temp(rect_id, inner.response.rect));
     let bubble = early.unwrap_or_else(|| ui.interact(inner.response.rect, bubble_id, Sense::CLICK));
@@ -2904,8 +3220,10 @@ fn bubble_frame(
     if reacting && !egui::Popup::is_id_open(ui.ctx(), bubble_id.with("popup")) {
         actions.push(Action::ClosePicker);
     }
-    // Store this frame's final rect for later scrolling.
-    inner.response
+    // This frame's final rect, for later scrolling, with the bubble's own
+    // clicks: the frame alone only senses hover, so a Ctrl-click to select
+    // or a click to add to a selection would never register.
+    inner.response.union(bubble)
 }
 
 /// Minimum shared width for cards inside message bubbles.
@@ -3452,10 +3770,18 @@ fn context_menu(ui: &mut egui::Ui, view: &View<'_>, message: &Message, actions: 
         actions.push(Action::Edit(message.id.clone()));
     }
     if can_revoke && widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete for everyone") {
-        actions.push(Action::DeleteForEveryone(message.id.clone()));
+        actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
+            chat: view.chat.id.clone(),
+            message: message.id.clone(),
+            for_everyone: true,
+        }));
     }
     if widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me") {
-        actions.push(Action::DeleteForMe(message.id.clone()));
+        actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
+            chat: view.chat.id.clone(),
+            message: message.id.clone(),
+            for_everyone: false,
+        }));
     }
     if let Content::Sticker { media, .. } = &message.content
         && let Some(path) = &media.path
@@ -3565,6 +3891,125 @@ fn quote_mentions(view: &View<'_>, quoted: &crate::model::Quoted) -> Vec<markup:
             name: (view.mention_names)(&mention.id),
         })
         .collect()
+}
+
+fn vcard_tel_preference(property: &str) -> Option<u8> {
+    let mut best = None;
+    for parameter in property.split(';').skip(1) {
+        let (name, value) = parameter.split_once('=').unwrap_or(("TYPE", parameter));
+        let value = value.trim_matches('"');
+        let rank = if name.eq_ignore_ascii_case("PREF") {
+            value
+                .parse::<u8>()
+                .ok()
+                .filter(|rank| (1..=100).contains(rank))
+        } else if name.eq_ignore_ascii_case("TYPE")
+            && value
+                .split(',')
+                .any(|value| value.eq_ignore_ascii_case("PREF"))
+        {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(rank) = rank {
+            best = Some(best.map_or(rank, |current: u8| current.min(rank)));
+        }
+    }
+    best
+}
+
+/// The first card of a shared contact, as the bubble uses it.
+#[derive(Debug, PartialEq)]
+struct SharedContact {
+    name: String,
+    /// The telephone number as the card writes it.
+    number: String,
+    /// The WhatsApp account behind the number, in digits: the `waid`
+    /// parameter WhatsApp adds, or a number written in international form.
+    /// A local number without a country code cannot name one.
+    account: Option<String>,
+}
+
+fn vcard_tel_account(property: &str, value: &str) -> Option<String> {
+    let digits = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_digit)
+            .collect::<String>()
+    };
+    let waid = property.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.eq_ignore_ascii_case("WAID")
+            .then(|| digits(value.trim_matches('"')))
+    });
+    waid.or_else(|| value.trim().starts_with('+').then(|| digits(value)))
+        .filter(|account| account.len() >= 7)
+}
+
+fn shared_contact_details(vcard: &str, fallback_name: &str) -> Option<SharedContact> {
+    let mut name = None;
+    let mut first_phone = None;
+    let mut preferred_phone: Option<(u8, (String, Option<String>))> = None;
+    let mut first_card: Vec<String> = Vec::new();
+    for line in vcard.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with([' ', '\t']) {
+            if let Some(previous) = first_card.last_mut() {
+                previous.push_str(line.trim_start());
+            }
+            continue;
+        }
+        if line.eq_ignore_ascii_case("END:VCARD") && !first_card.is_empty() {
+            break;
+        }
+        if line.eq_ignore_ascii_case("BEGIN:VCARD") {
+            if first_card.is_empty() {
+                first_card.push(line.to_owned());
+            }
+            continue;
+        }
+        if !first_card.is_empty() {
+            first_card.push(line.to_owned());
+        }
+    }
+    if first_card.is_empty() {
+        first_card.extend(vcard.lines().map(str::to_owned));
+    }
+    for line in first_card {
+        let Some((property, value)) = line.split_once(':') else {
+            continue;
+        };
+        let raw_name = property.split(';').next().unwrap_or(property);
+        let property_name = raw_name.rsplit('.').next().unwrap_or(raw_name);
+        if property_name.eq_ignore_ascii_case("FN") {
+            name = Some(value.trim().to_owned());
+        } else if property_name.eq_ignore_ascii_case("TEL") {
+            let number = value.trim().to_owned();
+            if number.chars().filter(char::is_ascii_digit).count() < 7 {
+                continue;
+            }
+            let phone = (number, vcard_tel_account(property, value));
+            if let Some(rank) = vcard_tel_preference(property) {
+                let replace = preferred_phone
+                    .as_ref()
+                    .is_none_or(|(best_rank, _)| rank < *best_rank);
+                if replace {
+                    preferred_phone = Some((rank, phone));
+                }
+            } else if first_phone.is_none() {
+                first_phone = Some(phone);
+            }
+        }
+    }
+    let (number, account) = preferred_phone.map(|(_, phone)| phone).or(first_phone)?;
+    let name = name
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| fallback_name.to_owned());
+    Some(SharedContact {
+        name,
+        number,
+        account,
+    })
 }
 
 /// Draws a message body and returns optional footer space on its last line.
@@ -3816,18 +4261,64 @@ fn content(
             let icon = |ui: &mut egui::Ui| {
                 theme::icon(ui, Icon::Contact, 18.0, palette.accent);
             };
+            let details = shared_contact_details(vcard, display_name);
             mirrored_row(ui, own, icon, |ui| {
                 ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    widgets::rich_text(ui, display_name, theme::medium(14.0), palette.text);
-                    let phone = vcard
-                        .lines()
-                        .find(|line| line.starts_with("TEL"))
-                        .and_then(|line| line.rsplit(':').next())
-                        .map(str::trim)
-                        .unwrap_or("");
-                    if !phone.is_empty() {
-                        theme::text(ui, phone, theme::regular(12.5), palette.secondary);
+                    ui.spacing_mut().item_spacing.y = 5.0;
+                    let name = details
+                        .as_ref()
+                        .map_or(display_name.as_str(), |contact| contact.name.as_str());
+                    widgets::rich_text(ui, name, theme::medium(14.0), palette.text);
+                    match details.as_ref() {
+                        Some(SharedContact {
+                            account: Some(account),
+                            ..
+                        }) => {
+                            let id = format!("{account}@s.whatsapp.net");
+                            ui.horizontal(|ui| {
+                                if theme::pill_button(
+                                    ui,
+                                    &palette,
+                                    crate::i18n::gettext(view.locale, "Chat").as_ref(),
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    actions.push(Action::StartChat {
+                                        id: id.clone(),
+                                        name: name.to_owned(),
+                                    });
+                                }
+                                if !view.contacts.contains_key(&id)
+                                    && theme::pill_button(
+                                        ui,
+                                        &palette,
+                                        crate::i18n::gettext(view.locale, "Add").as_ref(),
+                                        false,
+                                    )
+                                    .clicked()
+                                {
+                                    let (first, last) = crate::util::split_name(name);
+                                    actions.push(Action::NewContact {
+                                        phone: account.clone(),
+                                        first,
+                                        last,
+                                        to_phone: None,
+                                    });
+                                }
+                            });
+                        }
+                        // Without an account there is nothing to open, so
+                        // the number stays readable, as it was.
+                        Some(contact) => {
+                            theme::text(
+                                ui,
+                                &contact.number,
+                                theme::regular(12.5),
+                                palette.secondary,
+                            );
+                        }
+                        None => {}
                     }
                 });
             });
@@ -4902,7 +5393,21 @@ fn picture(
         // A row that is off screen only reserves its space. Loading the image
         // decodes it and uploads a texture, so it waits until it is scrolled
         // into view, and `image_cache` can release it once it leaves again.
-        let reserved = frame_size(media, None, max_width, max_height);
+        // The space is the size the picture was last drawn at, when known:
+        // a message without dimensions (or with wrong ones) would otherwise
+        // take one height on screen and another off it, and a picture across
+        // the top edge of a transcript held at its end would flip between
+        // them on every frame, shaking the whole chat (#179).
+        let fit = |pixels: Vec2| {
+            if sticker.is_some() {
+                fit_sticker(pixels.x, pixels.y)
+            } else {
+                fit_picture(pixels.x, pixels.y, max_width, max_height)
+            }
+        };
+        let pixels_id = egui::Id::new(("picture-pixels", path));
+        let drawn = ui.ctx().data(|data| data.get_temp::<Vec2>(pixels_id));
+        let reserved = drawn.map_or_else(|| frame_size(media, None, max_width, max_height), fit);
         let position = ui.next_widget_position();
         if !ui.is_rect_visible(Rect::from_min_size(position, reserved)) {
             ui.allocate_exact_size(reserved, Sense::hover());
@@ -4911,11 +5416,11 @@ fn picture(
         let image = widgets::file_image(ui, path);
         return match image.load_for_size(ui.ctx(), vec2(max_width, max_height)) {
             Ok(egui::load::TexturePoll::Ready { texture }) => {
-                let size = if sticker.is_some() {
-                    fit_sticker(texture.size.x, texture.size.y)
-                } else {
-                    fit_picture(texture.size.x, texture.size.y, max_width, max_height)
-                };
+                if drawn != Some(texture.size) {
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(pixels_id, texture.size));
+                }
+                let size = fit(texture.size);
                 let response = ui.add(
                     image
                         .fit_to_exact_size(size)
@@ -4939,10 +5444,11 @@ fn picture(
                 size.x
             }
             Ok(egui::load::TexturePoll::Pending { .. }) => {
-                let size = if sticker.is_some() {
-                    Vec2::splat(STICKER_SIDE)
-                } else {
-                    frame_size(media, None, max_width, max_height)
+                // A picture released while away loads again at its old size.
+                let size = match drawn {
+                    Some(pixels) => fit(pixels),
+                    None if sticker.is_some() => Vec2::splat(STICKER_SIDE),
+                    None => frame_size(media, None, max_width, max_height),
                 };
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 if ui.is_rect_visible(rect) {
@@ -5911,50 +6417,13 @@ fn recording_strip(app: &mut App, ui: &mut egui::Ui) {
         .round()
         .max(COMPOSER_CONTROL);
     let button = row_height;
+    // As in WhatsApp: discard at the start, the light and the time, the
+    // waveform across the rest, and send at the end.
     ui.allocate_ui_with_layout(
         vec2(ui.available_width().max(0.0), row_height),
-        egui::Layout::right_to_left(egui::Align::Center),
+        egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            if theme::circle_button(
-                ui,
-                Icon::Send,
-                button,
-                palette.accent,
-                palette.accent_hover,
-                palette.on_accent,
-                "Send",
-            )
-            .clicked()
-            {
-                app.actions.push(Action::SendRecording);
-            }
-            // Recent audio levels, newest on the right.
-            let wave_width = ui.available_width().clamp(40.0, 150.0);
-            let (rect, _) = ui.allocate_exact_size(vec2(wave_width, 28.0), Sense::hover());
-            let pitch = 3.0;
-            let count = (rect.width() / pitch).floor() as usize;
-            let start = levels.len().saturating_sub(count);
-            for (index, level) in levels[start..].iter().enumerate() {
-                let height = 2.0_f32 + (level * 4.0).min(1.0) * 24.0;
-                let x = rect.left() + index as f32 * pitch + 1.0;
-                ui.painter().rect_filled(
-                    Rect::from_center_size(egui::pos2(x, rect.center().y), vec2(2.0, height)),
-                    1.0,
-                    palette.accent,
-                );
-            }
-            // Pulsing recording light and elapsed time.
-            theme::text(
-                ui,
-                crate::util::duration(elapsed.as_secs() as u32),
-                theme::medium(14.0),
-                palette.text,
-            );
-            let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-            let pulse = 0.55 + 0.45 * (elapsed.as_secs_f32() * 3.0).sin().abs();
-            ui.painter()
-                .circle_filled(dot.center(), 5.0, palette.danger.gamma_multiply(pulse));
             if theme::circle_button(
                 ui,
                 Icon::Trash,
@@ -5968,8 +6437,54 @@ fn recording_strip(app: &mut App, ui: &mut egui::Ui) {
             {
                 app.actions.push(Action::CancelRecording);
             }
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+            let pulse = 0.55 + 0.45 * (elapsed.as_secs_f32() * 3.0).sin().abs();
+            ui.painter()
+                .circle_filled(dot.center(), 5.0, palette.danger.gamma_multiply(pulse));
+            theme::text(
+                ui,
+                crate::util::duration(elapsed.as_secs() as u32),
+                theme::medium(14.0),
+                palette.text,
+            );
+            // Recent audio levels, newest on the right against send.
+            let spacing = ui.spacing().item_spacing.x;
+            let wave_width = (ui.available_width() - button - spacing).max(0.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(wave_width, 28.0), Sense::hover());
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(recording_wave_id(), rect));
+            let pitch = 3.0;
+            let count = (rect.width() / pitch).floor() as usize;
+            let shown = &levels[levels.len().saturating_sub(count)..];
+            for (index, level) in shown.iter().enumerate() {
+                let height = 2.0_f32 + (level * 4.0).min(1.0) * 24.0;
+                let x = rect.right() - (shown.len() - index) as f32 * pitch + 1.0;
+                ui.painter().rect_filled(
+                    Rect::from_center_size(egui::pos2(x, rect.center().y), vec2(2.0, height)),
+                    1.0,
+                    palette.accent,
+                );
+            }
+            if theme::circle_button(
+                ui,
+                Icon::Send,
+                button,
+                palette.accent,
+                palette.accent_hover,
+                palette.on_accent,
+                "Send",
+            )
+            .clicked()
+            {
+                app.actions.push(Action::SendRecording);
+            }
         },
     );
+}
+
+/// Where the recorder's waveform was drawn, for layout tests.
+pub(crate) fn recording_wave_id() -> egui::Id {
+    egui::Id::new("recording-wave")
 }
 
 /// Replaces the composer while messages are selected.
@@ -6047,6 +6562,103 @@ fn chat_of(chat: &ChatId) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_pictures_show_in_groups_only() {
+        let chat = |id: &str| Chat::new(id.into(), "Chat".into());
+        assert!(shows_sender_pictures(&chat("120363012345678901@g.us")));
+        assert!(!shows_sender_pictures(&chat("393331234567@s.whatsapp.net")));
+        assert!(!shows_sender_pictures(&chat(
+            "120363055566677788@newsletter"
+        )));
+    }
+
+    fn contact(name: &str, number: &str, account: Option<&str>) -> Option<SharedContact> {
+        Some(SharedContact {
+            name: name.to_owned(),
+            number: number.to_owned(),
+            account: account.map(str::to_owned),
+        })
+    }
+
+    #[test]
+    fn shared_contact_accepts_case_insensitive_vcard_property_names() {
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nversion:3.0\nitem1.fn:Case-insensitive name\nitem1.tel;type=cell;waid=1234567:+1 234567\nEND:VCARD",
+                "Fallback",
+            ),
+            contact("Case-insensitive name", "+1 234567", Some("1234567"))
+        );
+    }
+
+    #[test]
+    fn shared_contact_uses_first_valid_telephone_when_multiple_are_present() {
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nFN:Two numbers\nTEL;TYPE=HOME:+1111111\nTEL;TYPE=CELL:+2222222\nEND:VCARD",
+                "Fallback",
+            ),
+            contact("Two numbers", "+1111111", Some("1111111"))
+        );
+    }
+
+    #[test]
+    fn shared_contact_prefers_lowest_vcard_tel_preference() {
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nFN:Preferred number\nTEL;TYPE=HOME:+1111111\nitem1.TEL;TYPE=CELL;PREF=2:+2222222\nTEL;TYPE=WORK;PREF=1:+3333333\nEND:VCARD",
+                "Fallback",
+            ),
+            contact("Preferred number", "+3333333", Some("3333333"))
+        );
+    }
+
+    #[test]
+    fn shared_contact_prefers_vcard_name_and_reads_the_account_from_waid() {
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nVERSION:3.0\nFN:Alice Example\nitem1.TEL;waid=15550101234:+1 (555) 010-1234\nEND:VCARD",
+                "Contact from sender",
+            ),
+            contact("Alice Example", "+1 (555) 010-1234", Some("15550101234"))
+        );
+    }
+
+    #[test]
+    fn a_local_number_names_no_account_and_stays_readable() {
+        // Without a country code the digits are not a WhatsApp account.
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nFN:Local\nTEL;TYPE=CELL:0171 1234567\nEND:VCARD",
+                "Fallback",
+            ),
+            contact("Local", "0171 1234567", None)
+        );
+    }
+
+    #[test]
+    fn shared_contact_without_vcard_name_uses_message_name_and_rejects_missing_phone() {
+        assert_eq!(
+            shared_contact_details("BEGIN:VCARD\nTEL:+1234567\nEND:VCARD", "Shared person"),
+            contact("Shared person", "+1234567", Some("1234567"))
+        );
+        assert_eq!(
+            shared_contact_details("BEGIN:VCARD\nFN:No phone\nEND:VCARD", "Fallback"),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_contact_details_use_the_first_vcard_when_multiple_contacts_are_shared() {
+        assert_eq!(
+            shared_contact_details(
+                "BEGIN:VCARD\nFN:Alice\nTEL:+15550101234\nEND:VCARD\nBEGIN:VCARD\nFN:Bob\nTEL:+15550105678\nEND:VCARD",
+                "Several contacts",
+            ),
+            contact("Alice", "+15550101234", Some("15550101234"))
+        );
+    }
 
     #[test]
     fn saved_attachments_suggest_a_plain_file_name() {
@@ -6213,6 +6825,17 @@ mod tests {
         assert!(!auto_download_allowed(&sticker, false, false));
         sticker.size = crate::model::ATTACHMENT_DOWNLOAD_LIMIT + 1;
         assert!(!auto_download_allowed(&sticker, true, false));
+    }
+
+    /// The typing dots animate at the display's rate, not a fixed timer.
+    #[test]
+    fn typing_dots_repaint_every_frame() {
+        let ctx = egui::Context::default();
+        let palette = crate::theme::Palette::dark();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| typing_dots(ui, &palette));
+        output.textures_delta.clear();
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert_eq!(delay, std::time::Duration::ZERO);
     }
 
     #[test]

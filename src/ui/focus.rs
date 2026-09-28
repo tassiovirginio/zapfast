@@ -22,8 +22,6 @@ pub enum Stop {
     NewChat,
     Settings,
     Search,
-    /// The Labels menu chip, when labels are not shown one chip each.
-    Labels,
     All,
     Unread,
     Private,
@@ -76,6 +74,16 @@ impl TabStop for Response {
         }
         self
     }
+}
+
+/// The widget last registered for `stop`, such as an icon button without
+/// painted text, so a scripted demo can find it where it was drawn.
+#[cfg(any(test, feature = "demo"))]
+pub(crate) fn control(ctx: &Context, stop: Stop) -> Option<Id> {
+    ctx.data(|data| data.get_temp::<Order>(order_id()))?
+        .controls
+        .into_iter()
+        .find_map(|(known, id)| (known == stop).then_some(id))
 }
 
 /// Intercept Tab before any widgets are registered. Merely consuming the key

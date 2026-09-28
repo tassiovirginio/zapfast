@@ -126,6 +126,11 @@ pub struct Chat {
     /// `read_only`, which an announcement group also carries and which a later
     /// metadata refresh rewrites.
     pub left: bool,
+    /// Whether only admins may change the group's name and photo (WhatsApp's
+    /// "Edit group settings"); `None` until the group's metadata has said.
+    pub info_locked: Option<bool>,
+    /// Whether we are an admin of this group, as its metadata last said.
+    pub admin: bool,
     /// Hidden while WhatsApp chat lock is enabled on the phone.
     pub locked: bool,
     /// Disappearing-message duration in seconds, if enabled.
@@ -143,6 +148,9 @@ pub struct LastMessage {
     /// Group-message sender.
     pub sender_name: Option<String>,
     pub summary: String,
+    /// The whole message behind `summary`, every line of it: the chat row
+    /// shows it in a tooltip when the one-line preview cannot.
+    pub full: String,
     pub status: Delivery,
 }
 
@@ -167,6 +175,8 @@ impl Chat {
             participants: Vec::new(),
             read_only: false,
             left: false,
+            info_locked: None,
+            admin: false,
             locked: false,
             ephemeral_expiration: None,
             labels: Vec::new(),
@@ -211,6 +221,14 @@ impl Chat {
             return false;
         }
         ours.is_empty() || self.participants.is_empty() || self.lists_any(ours)
+    }
+
+    /// Whether we may change the group's name and photo: any member while the
+    /// group's info is open to everyone, only admins once it is locked. Until
+    /// the metadata says which, nothing is offered, and a group we left is
+    /// not ours to edit.
+    pub fn can_edit_info(&self) -> bool {
+        self.is_group() && !self.left && (self.admin || self.info_locked == Some(false))
     }
 
     /// Whether the member list names any of `ours`.
@@ -564,6 +582,9 @@ impl PollDraft {
     }
 }
 
+/// The longest group name WhatsApp accepts, in characters.
+pub const GROUP_NAME_LIMIT: usize = whatsapp_rust::wacore::iq::groups::GROUP_SUBJECT_MAX_LENGTH;
+
 /// WhatsApp's longest live location share, in seconds.
 pub const LIVE_LOCATION_LIMIT: i64 = 8 * 60 * 60;
 
@@ -621,6 +642,24 @@ impl Content {
         }
     }
 
+    /// The whole message as [`Self::summary`] would label it: every line of
+    /// a text or a photo or video caption. Other content has nothing more
+    /// to say than its summary.
+    pub fn full_summary(&self) -> String {
+        let captioned = |label: &str, caption: &Option<String>| match caption.as_deref() {
+            Some(caption) if !caption.trim().is_empty() => format!("{label}: {caption}"),
+            _ => label.to_owned(),
+        };
+        match self {
+            Self::Text { text, .. } | Self::Interactive { text, .. } => text.clone(),
+            Self::Image { caption, .. } => captioned("Photo", caption),
+            Self::Video {
+                caption, gif, note, ..
+            } => captioned(video_label(*gif, *note), caption),
+            _ => self.summary(),
+        }
+    }
+
     pub fn summary(&self) -> String {
         match self {
             Self::Text { text, .. } | Self::Interactive { text, .. } => {
@@ -629,16 +668,7 @@ impl Content {
             Self::Image { caption, .. } => with_caption("Photo", caption),
             Self::Video {
                 caption, gif, note, ..
-            } => with_caption(
-                if *gif {
-                    "GIF"
-                } else if *note {
-                    "Video message"
-                } else {
-                    "Video"
-                },
-                caption,
-            ),
+            } => with_caption(video_label(*gif, *note), caption),
             Self::Audio {
                 voice_note,
                 seconds,
@@ -752,6 +782,17 @@ impl Content {
     }
 }
 
+/// What a video is called in previews.
+fn video_label(gif: bool, note: bool) -> &'static str {
+    if gif {
+        "GIF"
+    } else if note {
+        "Video message"
+    } else {
+        "Video"
+    }
+}
+
 fn with_caption(label: &str, caption: &Option<String>) -> String {
     match caption
         .as_deref()
@@ -797,6 +838,14 @@ pub enum MediaState {
     Idle,
     Downloading,
     Failed(String),
+}
+
+/// Decoded straight-alpha RGBA image bytes ready for the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedImage {
+    pub width: usize,
+    pub height: usize,
+    pub bytes: Vec<u8>,
 }
 
 /// Contact names from app-state sync and message push names.
@@ -850,8 +899,6 @@ pub enum SidebarDisplayMode {
     Expanded,
     /// Avatars and unread badges only, in a narrow column.
     CollapsedIconsOnly,
-    /// Nothing at all.
-    Hidden,
 }
 
 /// Which list the sticker tab shows.
@@ -861,6 +908,8 @@ pub enum StickerShelf {
     #[default]
     Recent,
     Favorites,
+    /// Stickers others sent us, newest first.
+    Received,
     /// One pack, by its folder.
     Pack(PathBuf),
     /// Importing packs, starting one, or making a sticker.
@@ -982,8 +1031,18 @@ pub enum Dialog {
     Labels,
     /// Confirms deleting a chat, which cannot be undone.
     ConfirmDeleteChat(ChatId),
+    /// Confirms clearing a chat's messages, which cannot be undone.
+    ConfirmClearChat(ChatId),
     /// Leaves a group or channel, optionally archiving the chat.
     ConfirmLeaveGroup(ChatId),
+    /// Confirms deleting one message. The archive is the only copy, so a
+    /// local delete cannot be undone either.
+    ConfirmDeleteMessage {
+        chat: ChatId,
+        message: String,
+        /// Revokes for everyone instead of deleting only this copy.
+        for_everyone: bool,
+    },
     /// Chooses a destination for an archived message.
     Forward {
         chat: ChatId,
@@ -1126,10 +1185,26 @@ pub struct Toast {
     pub created: Instant,
 }
 
+/// A scroll request for the open chat's message list, from the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    /// About one screen toward older messages.
+    PageUp,
+    /// About one screen toward newer messages.
+    PageDown,
+    /// The top of the loaded history.
+    Top,
+    /// The newest message, eased. `Action::ScrollToBottom` (Ctrl+End) jumps
+    /// there at once.
+    Bottom,
+}
+
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Open(Page),
+    /// Opens settings, or closes them when they are already showing.
+    ToggleSettings,
     OpenChat(ChatId),
     /// Creates and opens a chat for a contact without one.
     StartChat {
@@ -1231,6 +1306,8 @@ pub enum Action {
     /// Open externally button inside the preview.
     PreviewImage(PathBuf),
     ZoomImageIn,
+    /// Scales the previewed image by a factor, as the wheel or a pinch asks.
+    ZoomImageBy(f32),
     /// Shows the previewed image at its original size.
     ImageActualSize,
     ZoomImageOut,
@@ -1245,6 +1322,7 @@ pub enum Action {
     },
     OpenUrl(String),
     CopyText(String),
+    CopyImage(PathBuf),
     /// Closes the toast at this index. Only errors wait to be dismissed.
     DismissToast(usize),
     /// Starts a reply to a message in the open chat.
@@ -1356,10 +1434,13 @@ pub enum Action {
         last: String,
     },
     /// Checks a number, optionally saves it, and opens its chat.
+    /// `to_phone` is the dialog's "Save to phone" choice; `None` uses the
+    /// last one.
     NewContact {
         phone: String,
         first: String,
         last: String,
+        to_phone: Option<bool>,
     },
     /// Searches GIFs or lists trending results for an empty query.
     SearchGifs(String),
@@ -1377,6 +1458,8 @@ pub enum Action {
     },
     /// Deletes a chat here and on the phone.
     DeleteChat(ChatId),
+    /// Clears a chat's messages here and on the phone, keeping the chat.
+    ClearChat(ChatId),
     SetPinned(ChatId, bool),
     /// Marks a chat as a favorite, or removes the mark, here and on the phone.
     SetFavorite(ChatId, bool),
@@ -1420,7 +1503,7 @@ pub enum Action {
     /// Filters the Settings page to the rows matching this text.
     SearchSettings(String),
     FocusComposer,
-    HideShortcutHints,
+    SetShortcutHints(bool),
     DismissChatLockHint,
     OpenLockedFolder,
     UnlockLockedFolder(String),
@@ -1429,6 +1512,8 @@ pub enum Action {
     CloseLockedFolder,
     SetChatLockCode(Option<String>),
     ScrollToBottom,
+    /// Scrolls the open chat by about a page, or to the top of its history.
+    ScrollPage(Scroll),
     /// Scrolls the open chat to a message.
     ScrollTo(String),
     /// Updates chat-list search text.
@@ -1442,6 +1527,10 @@ pub enum Action {
     SetCustomTheme(String),
     SetWallpaperColor(crate::settings::WallpaperColor),
     SetWallpaperDoodles(bool),
+    /// Asks for an image to use as the chat wallpaper.
+    PickWallpaperImage,
+    /// Goes back to the wallpaper colour and deletes the copied image.
+    RemoveWallpaperImage,
     ReloadThemes,
     OpenThemesFolder,
     SettingsChanged,
@@ -1478,6 +1567,20 @@ pub enum Action {
     },
     /// Asks for a picture and makes it our profile picture.
     PickProfilePicture,
+    /// Opens the group name editor in the group info dialog, starting from
+    /// the current name.
+    EditGroupName(String),
+    /// Closes the group name editor without renaming.
+    CloseGroupName,
+    /// Renames a group on WhatsApp; the editor closes.
+    SetGroupName {
+        chat: ChatId,
+        name: String,
+    },
+    /// Asks for a picture and makes it the group's photo.
+    PickGroupPicture(ChatId),
+    /// Removes the group's photo.
+    RemoveGroupPicture(ChatId),
     /// Sets or resets (`None`) the folder for new downloads.
     SetDownloadFolder(Option<PathBuf>),
     /// Saves the proxy setting and reconnects. Empty follows the environment.
@@ -1577,6 +1680,25 @@ mod tests {
         chat.left = false;
         chat.participants = vec![me.into()];
         assert!(chat.can_leave(&[me]));
+    }
+
+    #[test]
+    fn group_info_is_editable_when_open_or_by_admins() {
+        let mut chat = super::Chat::new("1-2@g.us".into(), "Rust".into());
+        assert!(!chat.can_edit_info(), "unknown until the metadata says");
+        chat.info_locked = Some(false);
+        assert!(chat.can_edit_info(), "an open group lets every member edit");
+        chat.info_locked = Some(true);
+        assert!(!chat.can_edit_info(), "a locked group is for admins");
+        chat.admin = true;
+        assert!(chat.can_edit_info(), "which we are");
+        chat.left = true;
+        assert!(!chat.can_edit_info(), "a group we left is not ours to edit");
+
+        let mut direct = super::Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        direct.info_locked = Some(false);
+        direct.admin = true;
+        assert!(!direct.can_edit_info(), "only groups have group info");
     }
 
     #[test]
@@ -1816,6 +1938,26 @@ mod tests {
             .summary(),
             "Voice message (1:05)"
         );
+    }
+
+    #[test]
+    fn full_summaries_keep_every_line_behind_the_summary_label() {
+        assert_eq!(Content::text("hi\nthere").full_summary(), "hi\nthere");
+        assert_eq!(
+            Content::Image {
+                caption: Some("look\nat this".into()),
+                media: media()
+            }
+            .full_summary(),
+            "Photo: look\nat this"
+        );
+        let voice = Content::Audio {
+            media: media(),
+            seconds: Some(65),
+            voice_note: true,
+            waveform: Vec::new(),
+        };
+        assert_eq!(voice.full_summary(), voice.summary());
     }
 
     #[test]

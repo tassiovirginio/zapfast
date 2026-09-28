@@ -46,11 +46,14 @@ impl ThemeChoice {
     }
 }
 
-/// Background colours offered by WhatsApp's wallpaper picker.
+/// Background colours offered by WhatsApp's wallpaper picker, after the
+/// active theme's own chat colour.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WallpaperColor {
+    /// The active palette's `chat` colour, so a custom theme sets the wallpaper.
     #[default]
+    Theme,
     Beige,
     Cruise,
     Scandal,
@@ -103,7 +106,8 @@ pub enum WallpaperColor {
 }
 
 impl WallpaperColor {
-    pub const LIGHT: [Self; 28] = [
+    pub const LIGHT: [Self; 29] = [
+        Self::Theme,
         Self::Beige,
         Self::Cruise,
         Self::Scandal,
@@ -134,7 +138,8 @@ impl WallpaperColor {
         Self::WillowBrook,
     ];
 
-    pub const DARK: [Self; 21] = [
+    pub const DARK: [Self; 22] = [
+        Self::Theme,
         Self::Black,
         Self::Nordic,
         Self::CardinGreen,
@@ -162,8 +167,10 @@ impl WallpaperColor {
         if dark { &Self::DARK } else { &Self::LIGHT }
     }
 
+    /// The colour's English name. The interface translates [`Self::Theme`]'s.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Theme => "Theme",
             Self::Beige => "Beige",
             Self::Cruise => "Cruise",
             Self::Scandal => "Scandal",
@@ -216,8 +223,11 @@ impl WallpaperColor {
         }
     }
 
-    pub fn rgb(self) -> [u8; 3] {
-        match self {
+    /// A fixed colour's value; `None` for [`Self::Theme`], which follows the
+    /// palette.
+    pub fn rgb(self) -> Option<[u8; 3]> {
+        Some(match self {
+            Self::Theme => return None,
             Self::Beige => [245, 241, 235],
             Self::Cruise => [187, 228, 229],
             Self::Scandal => [174, 216, 199],
@@ -267,11 +277,16 @@ impl WallpaperColor {
             Self::DarkTolopea => [17, 11, 18],
             Self::Woodsmoke => [30, 31, 31],
             Self::MaireTwo => [35, 35, 31],
-        }
+        })
     }
 
-    pub fn color32(self) -> egui::Color32 {
-        egui::Color32::from_rgb(self.rgb()[0], self.rgb()[1], self.rgb()[2])
+    /// The colour drawn under `palette`: [`Self::Theme`] is its chat colour,
+    /// read at draw time so a theme switch or Omarchy reload shows at once.
+    pub fn color32(self, palette: &crate::theme::Palette) -> egui::Color32 {
+        match self.rgb() {
+            Some([r, g, b]) => egui::Color32::from_rgb(r, g, b),
+            None => palette.chat,
+        }
     }
 }
 
@@ -297,6 +312,9 @@ pub enum NotificationSound {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// [`SETTINGS_VERSION`] when written; missing, and so 0, in older files.
+    #[serde(default)]
+    pub version: u32,
     pub theme: ThemeChoice,
     /// Interface language. `None` follows the operating system's locale.
     pub interface_language: Option<crate::i18n::Locale>,
@@ -304,44 +322,44 @@ pub struct Settings {
     pub custom_theme: Option<String>,
     #[serde(
         default,
-        deserialize_with = "crate::theme::custom::read_cached_theme",
+        deserialize_with = "fastframe_theme::read_cached_theme",
         skip_serializing_if = "Option::is_none"
     )]
-    pub custom_theme_cache: Option<crate::theme::custom::CustomTheme>,
+    pub custom_theme_cache: Option<crate::theme::CustomTheme>,
     #[serde(
         default,
-        deserialize_with = "crate::theme::custom::read_cached_theme",
+        deserialize_with = "fastframe_theme::read_cached_theme",
         skip_serializing_if = "Option::is_none"
     )]
-    pub system_theme_cache: Option<crate::theme::custom::CustomTheme>,
+    pub system_theme_cache: Option<crate::theme::CustomTheme>,
     /// egui zoom factor.
     pub zoom: f32,
     pub sidebar_width: f32,
     /// Width of the search pane beside the open chat.
     pub search_pane_width: f32,
-    /// Hiding the chat list collapses it to avatars instead of removing it.
-    pub collapse_chat_list: bool,
-    /// Whether Enter sends and Shift+Enter adds a line. Off swaps them.
+    /// Whether Enter sends. Off, Enter adds a line and Ctrl+Enter (Cmd+Enter
+    /// on macOS) sends.
     pub enter_sends: bool,
     /// Send read receipts, subject to the account privacy setting.
     pub send_read_receipts: bool,
-    /// Show each label as its own filter chip instead of one Labels menu chip.
-    pub label_chips: bool,
     /// Send typing state while composing.
     pub send_typing: bool,
     /// Download attachments when they enter view instead of on click.
     #[serde(alias = "auto_download_images")]
     pub auto_download: bool,
-    /// Show sender avatars outside groups too.
-    pub show_sender_pictures: bool,
     /// Show the default doodle wallpaper behind conversations.
     pub show_wallpaper: bool,
     /// Colour selected in the wallpaper picker.
     pub wallpaper_color: WallpaperColor,
     /// Colour selected for the dark wallpaper picker.
     pub dark_wallpaper_color: WallpaperColor,
+    /// ZapFast's own copy of the chosen wallpaper image, drawn in place of the
+    /// colour and doodles in light and dark mode alike.
+    pub wallpaper_image: Option<std::path::PathBuf>,
     /// Last open chat, restored at startup.
     pub last_chat: Option<String>,
+    /// The hint bar under the composer, hidden with its × and shown again
+    /// from the Keyboard shortcuts dialog.
     pub show_shortcut_hints: bool,
     /// Recently used emoji, newest first.
     pub recent_emoji: Vec<String>,
@@ -371,15 +389,19 @@ pub struct Settings {
     pub check_for_updates: bool,
     /// Download verified updates in the background; restarting remains explicit.
     pub download_updates_automatically: bool,
-    /// Prefer address-book names over public profile names.
-    pub names_from_contacts: bool,
     /// Voice and audio playback speed multiplier.
     pub voice_speed: f32,
-    /// Pause other apps' media while recording a voice message.
-    pub pause_media_while_recording: bool,
-    /// Pause other apps' media while a voice or audio message plays.
-    pub pause_media_while_playing: bool,
-    /// Also add saved contacts to the phone's address book.
+    /// Pause other apps' media while recording, or while a voice message,
+    /// audio, or video plays with sound.
+    pub pause_other_media: bool,
+    /// The two switches `pause_other_media` replaced, read once and folded
+    /// into it by [`Settings::load`].
+    #[serde(skip_serializing)]
+    pub pause_media_while_recording: Option<bool>,
+    #[serde(skip_serializing)]
+    pub pause_media_while_playing: Option<bool>,
+    /// The last choice of the new-contact dialog's "Save to phone" box, which
+    /// starts the next one and applies when a contact is renamed.
     pub save_contacts_to_phone: bool,
     /// Legacy plaintext code, accepted once and rewritten as a verifier.
     #[serde(skip_serializing)]
@@ -393,6 +415,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            version: SETTINGS_VERSION,
             theme: ThemeChoice::Dark,
             interface_language: None,
             custom_theme: None,
@@ -401,16 +424,14 @@ impl Default for Settings {
             zoom: 1.0,
             sidebar_width: 320.0,
             search_pane_width: 380.0,
-            collapse_chat_list: false,
             enter_sends: true,
             send_read_receipts: true,
-            label_chips: false,
             send_typing: true,
             auto_download: true,
-            show_sender_pictures: false,
             show_wallpaper: true,
-            wallpaper_color: WallpaperColor::default(),
-            dark_wallpaper_color: WallpaperColor::Black,
+            wallpaper_color: WallpaperColor::Theme,
+            dark_wallpaper_color: WallpaperColor::Theme,
+            wallpaper_image: None,
             last_chat: None,
             show_shortcut_hints: true,
             recent_emoji: Vec::new(),
@@ -425,17 +446,24 @@ impl Default for Settings {
             proxy: String::new(),
             check_for_updates: true,
             download_updates_automatically: false,
-            names_from_contacts: true,
             save_contacts_to_phone: true,
             voice_speed: 1.0,
-            pause_media_while_recording: true,
-            pause_media_while_playing: true,
+            pause_other_media: true,
+            pause_media_while_recording: None,
+            pause_media_while_playing: None,
             chat_lock_code: None,
             chat_lock_code_hash: None,
             chat_lock_hint_dismissed: false,
         }
     }
 }
+
+/// The settings file's format. Files without a version predate it and are
+/// migrated once by [`Settings::load`]:
+///
+/// 1. The wallpaper colours that were the defaults (Beige, and Black in dark
+///    mode) become [`WallpaperColor::Theme`], the new default.
+pub const SETTINGS_VERSION: u32 = 1;
 
 /// Optional build-time GIPHY key from `ZAPFAST_GIPHY_KEY`.
 /// The previous name remains accepted for existing build setups.
@@ -451,6 +479,11 @@ impl Settings {
         } else {
             self.wallpaper_color
         }
+    }
+
+    /// The wallpaper colour for `palette`, with Theme resolved against it.
+    pub fn wallpaper_background(&self, palette: &crate::theme::Palette) -> egui::Color32 {
+        self.wallpaper_color_for(palette.dark).color32(palette)
     }
 
     pub(crate) fn cached_palette(&self) -> Option<crate::theme::Palette> {
@@ -480,6 +513,8 @@ impl Settings {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_json::from_str::<Self>(&contents) {
                 Ok(mut settings) => {
+                    settings.migrate();
+                    settings.fold_legacy_media_pause();
                     if let Some(code) = settings.chat_lock_code.take() {
                         settings.set_chat_lock_code(Some(&code));
                         if let Err(error) = settings.save(path) {
@@ -510,6 +545,36 @@ impl Settings {
         let temp = path.with_extension("json.tmp");
         std::fs::write(&temp, contents)?;
         std::fs::rename(&temp, path)
+    }
+
+    /// Brings a file written before [`SETTINGS_VERSION`] up to date. Each
+    /// step runs once: the next save records the version, so a colour chosen
+    /// again afterwards is kept.
+    fn migrate(&mut self) {
+        if self.version < 1 {
+            // Old files store every field, so a default colour cannot be told
+            // from a chosen one; the old defaults move to the new one.
+            if self.wallpaper_color == WallpaperColor::Beige {
+                self.wallpaper_color = WallpaperColor::Theme;
+            }
+            if self.dark_wallpaper_color == WallpaperColor::Black {
+                self.dark_wallpaper_color = WallpaperColor::Theme;
+            }
+        }
+        self.version = self.version.max(SETTINGS_VERSION);
+    }
+
+    /// Folds the former recording and playback switches into
+    /// `pause_other_media`. A file that still has them was last written by a
+    /// version without the merged switch, so they win: media keeps pausing
+    /// only if neither was turned off, which never pauses music for someone
+    /// who asked it not to be. The next save drops them.
+    fn fold_legacy_media_pause(&mut self) {
+        let recording = self.pause_media_while_recording.take();
+        let playing = self.pause_media_while_playing.take();
+        if recording.is_some() || playing.is_some() {
+            self.pause_other_media = recording.unwrap_or(true) && playing.unwrap_or(true);
+        }
     }
 
     pub fn set_chat_lock_code(&mut self, code: Option<&str>) {
@@ -592,11 +657,66 @@ mod tests {
         assert!(parsed.check_for_updates);
         assert!(!parsed.download_updates_automatically);
         assert!(parsed.show_wallpaper);
-        assert_eq!(parsed.wallpaper_color, WallpaperColor::Beige);
-        assert!(
-            !parsed.collapse_chat_list,
-            "hiding the list keeps removing it until asked otherwise"
+        assert_eq!(parsed.wallpaper_color, WallpaperColor::Theme);
+        assert!(parsed.pause_other_media);
+    }
+
+    fn load_from(contents: &str) -> (Settings, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, contents).unwrap();
+        let settings = Settings::load(&path);
+        settings.save(&path).unwrap();
+        let stored = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        (settings, stored)
+    }
+
+    #[test]
+    fn removed_settings_are_ignored_and_dropped_on_save() {
+        let (settings, stored) = load_from(
+            r#"{"enter_sends":false,"label_chips":true,"show_sender_pictures":true,
+                "names_from_contacts":false,"collapse_chat_list":false,
+                "save_contacts_to_phone":false}"#,
         );
+        assert!(!settings.enter_sends, "the rest of the file still loads");
+        assert!(
+            !settings.save_contacts_to_phone,
+            "the old switch starts the new-contact box"
+        );
+        for key in [
+            "label_chips",
+            "show_sender_pictures",
+            "names_from_contacts",
+            "collapse_chat_list",
+            "pause_media_while_recording",
+            "pause_media_while_playing",
+        ] {
+            assert!(stored.get(key).is_none(), "{key} is dropped on save");
+        }
+        assert_eq!(stored["pause_other_media"], true);
+    }
+
+    #[test]
+    fn the_two_media_pause_switches_merge_into_one() {
+        let merged = |contents: &str| {
+            let (settings, stored) = load_from(contents);
+            assert!(stored.get("pause_media_while_recording").is_none());
+            assert!(stored.get("pause_media_while_playing").is_none());
+            settings.pause_other_media
+        };
+        assert!(merged(
+            r#"{"pause_media_while_recording":true,"pause_media_while_playing":true}"#
+        ));
+        assert!(!merged(
+            r#"{"pause_media_while_recording":false,"pause_media_while_playing":true}"#
+        ));
+        assert!(!merged(
+            r#"{"pause_media_while_recording":true,"pause_media_while_playing":false}"#
+        ));
+        assert!(!merged(r#"{"pause_media_while_playing":false}"#));
+        assert!(merged(r#"{"pause_media_while_recording":true}"#));
+        assert!(merged("{}"), "on by default");
+        assert!(!merged(r#"{"pause_other_media":false}"#));
     }
 
     #[test]
@@ -615,7 +735,7 @@ mod tests {
             zoom: 1.25,
             enter_sends: false,
             voice_speed: 1.5,
-            collapse_chat_list: true,
+            pause_other_media: false,
             interface_language: Some(crate::i18n::Locale::German),
             message_sound: NotificationSound::None,
             mention_sound: NotificationSound::Custom("/sounds/ding.wav".into()),
@@ -668,11 +788,82 @@ mod tests {
 
     #[test]
     fn wallpaper_palette_contains_the_official_colours() {
-        assert_eq!(WallpaperColor::LIGHT.len(), 28);
-        assert_eq!(WallpaperColor::DARK.len(), 21);
-        assert_eq!(WallpaperColor::Beige.rgb(), [245, 241, 235]);
-        assert_eq!(WallpaperColor::Black.rgb(), [22, 23, 23]);
+        // WhatsApp's 28 light and 21 dark colours, after the theme's own.
+        assert_eq!(WallpaperColor::LIGHT.len(), 29);
+        assert_eq!(WallpaperColor::DARK.len(), 22);
+        assert_eq!(WallpaperColor::LIGHT[0], WallpaperColor::Theme);
+        assert_eq!(WallpaperColor::DARK[0], WallpaperColor::Theme);
+        assert_eq!(WallpaperColor::Beige.rgb(), Some([245, 241, 235]));
+        assert_eq!(WallpaperColor::Black.rgb(), Some([22, 23, 23]));
         assert_eq!(WallpaperColor::WillowBrook.label(), "Willow Brook");
+    }
+
+    #[test]
+    fn the_theme_wallpaper_is_the_palettes_chat_colour() {
+        use crate::theme::Palette;
+        let settings = Settings::default();
+        assert_eq!(settings.wallpaper_color, WallpaperColor::Theme);
+        assert_eq!(settings.dark_wallpaper_color, WallpaperColor::Theme);
+        let light = Palette::light();
+        let dark = Palette::dark();
+        assert_eq!(settings.wallpaper_background(&light), light.chat);
+        assert_eq!(settings.wallpaper_background(&dark), dark.chat);
+        let mut custom = Palette::dark();
+        custom.chat = egui::Color32::from_rgb(30, 30, 46);
+        assert_eq!(settings.wallpaper_background(&custom), custom.chat);
+        // A fixed colour ignores the palette.
+        let chosen = Settings {
+            dark_wallpaper_color: WallpaperColor::Nordic,
+            ..Settings::default()
+        };
+        assert_eq!(
+            chosen.wallpaper_background(&custom),
+            egui::Color32::from_rgb(15, 36, 36)
+        );
+        assert_eq!(chosen.wallpaper_background(&light), light.chat);
+    }
+
+    #[test]
+    fn the_old_default_wallpaper_colours_become_the_theme_once() {
+        let (settings, stored) =
+            load_from(r#"{"wallpaper_color":"beige","dark_wallpaper_color":"black"}"#);
+        assert_eq!(settings.wallpaper_color, WallpaperColor::Theme);
+        assert_eq!(settings.dark_wallpaper_color, WallpaperColor::Theme);
+        assert_eq!(stored["version"], SETTINGS_VERSION);
+        assert_eq!(stored["wallpaper_color"], "theme");
+
+        // Chosen colours survive the migration.
+        let (settings, _) =
+            load_from(r#"{"wallpaper_color":"cruise","dark_wallpaper_color":"nordic"}"#);
+        assert_eq!(settings.wallpaper_color, WallpaperColor::Cruise);
+        assert_eq!(settings.dark_wallpaper_color, WallpaperColor::Nordic);
+        let (settings, _) =
+            load_from(r#"{"wallpaper_color":"beige","dark_wallpaper_color":"tiber"}"#);
+        assert_eq!(settings.wallpaper_color, WallpaperColor::Theme);
+        assert_eq!(settings.dark_wallpaper_color, WallpaperColor::Tiber);
+
+        // Once migrated, choosing Beige or Black again sticks.
+        let (settings, _) =
+            load_from(r#"{"version":1,"wallpaper_color":"beige","dark_wallpaper_color":"black"}"#);
+        assert_eq!(settings.wallpaper_color, WallpaperColor::Beige);
+        assert_eq!(settings.dark_wallpaper_color, WallpaperColor::Black);
+
+        // A current file round-trips unchanged, image path included.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let chosen = Settings {
+            wallpaper_color: WallpaperColor::Beige,
+            dark_wallpaper_color: WallpaperColor::Black,
+            wallpaper_image: Some(dir.path().join("wallpaper.png")),
+            ..Settings::default()
+        };
+        chosen.save(&path).unwrap();
+        assert_eq!(Settings::load(&path), chosen);
+        assert_eq!(
+            Settings::load(&path),
+            chosen,
+            "loading again changes nothing"
+        );
     }
 }
 

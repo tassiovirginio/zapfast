@@ -18,15 +18,16 @@ hero:
       text: GitHub
       link: https://github.com/crmne/zapfast
   image:
-    src: /screenshot.png
+    dark: /screenshot.png
+    light: /screenshot-light.png
     alt: "ZapFast showing a conversation with an attachment, voice messages, reactions, a quoted reply, and a link preview"
-    width: 1387
-    height: 1040
+    width: 1800
+    height: 1360
 
 features:
   - icon: ⚡
     title: Lightweight
-    details: Opens in under a second and uses 150MB of RAM. No browser engine.
+    details: Opens in under a second and uses about 200MB of RAM. No browser engine.
   - icon: 🎤
     title: Voice messages
     details: Play, seek, and record voice messages in the chat. OGG/Opus support is built in.
@@ -46,7 +47,16 @@ features:
     link_text: Read the source
 ---
 
+<p class="sibling"><strong>Want Spotify just as fast and native?</strong> <a href="https://spotifast.rocks">Spotifast</a> is ZapFast's sibling: the same native interface, for Spotify. Both are built on <a href="https://github.com/crmne/fastframe">fastframe</a>, the shared foundation for native Rust apps built with egui.</p>
+
 <style>
+  .sibling {
+    max-width: 1152px;
+    margin: 48px auto 0;
+    padding: 0 24px;
+    text-align: center;
+    color: var(--vp-c-text-2);
+  }
   /* Override the square hero slot to fit the screenshot. */
   .VPHero .image-container {
     width: 100% !important;
